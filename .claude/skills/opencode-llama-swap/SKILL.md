@@ -31,7 +31,7 @@ nothing about the model is hardcoded.
 
 | File | Role |
 |---|---|
-| `Dockerfile` | Builds the opencode image (node/npm + opencode, openssh, git, python3+`huggingface_hub[cli]`+`hf_transfer`). Key-only SSH, no root login. |
+| `Dockerfile` | Builds the opencode image (node/npm + opencode, openssh, git, python3+`huggingface_hub[cli,hf_xet]`). Key-only SSH, no root login. |
 | `entrypoint.sh` | Remaps `user` to PUID/PGID, installs `authorized_keys`, generates `~/.config/opencode/opencode.json` (once), waits for llama-swap `/health`, then `exec sshd -D -e`. |
 | `init-llama-swap.sh` | Runs *inside the upstream llama-swap image*. Downloads GGUF from HF if missing, resolves the model file (+shards +mmproj), generates `/models/config.yaml`, `exec llama-swap ...`. |
 | `docker-compose.nvidia.yml` | CUDA image + `deploy.resources` nvidia device reservation. |
@@ -71,6 +71,8 @@ nothing about the model is hardcoded.
 
 ## Conventions
 
+- **All comments are written in English** — code, YAML, Dockerfile, and shell.
+  This is a hard rule for the whole project regardless of the chat language.
 - Compose services use `env_file: .env` instead of enumerating every variable —
   keep it that way; add new vars to `.env.example` and they're available to both
   containers automatically.

@@ -219,7 +219,8 @@ HSA_OVERRIDE_GFX_VERSION=11.0.0
   `MODELS_PATH/<MODEL_ID>` on the host and restart llama-swap.
 - **Watch it:** `docker compose -f docker-compose.nvidia.yml logs -f llama-swap`.
 
-Downloads use `hf_transfer` (`HF_HUB_ENABLE_HF_TRANSFER=1`) for speed.
+Downloads use the Xet backend in high-performance mode
+(`HF_XET_HIGH_PERFORMANCE=1`) for speed.
 
 ---
 

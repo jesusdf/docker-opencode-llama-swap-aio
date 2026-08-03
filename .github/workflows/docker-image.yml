@@ -6,13 +6,13 @@ on:
   pull_request:
     branches: [ "main" ]
   schedule:
-    - cron: "0 6 * * 1"   # cada lunes a las 06:00 UTC
+    - cron: "0 6 * * 1"   # every Monday at 06:00 UTC
   workflow_dispatch:
 
 jobs:
   check-base:
-    # Solo en ejecuciones programadas: decide si debian:13-slim ha cambiado
-    # desde la última imagen publicada.
+    # Scheduled runs only: decide whether debian:13-slim has changed
+    # since the last published image.
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule'
     outputs:
@@ -20,32 +20,32 @@ jobs:
     steps:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-      - name: Digest actual de debian:13-slim
+      - name: Current debian:13-slim digest
         id: current
         run: |
           digest=$(docker buildx imagetools inspect debian:13-slim --format '{{.Manifest.Digest}}')
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
-      - name: Digest base de la imagen publicada
+      - name: Base digest of the published image
         id: published
         run: |
           ref="docker.io/${{ github.repository_owner }}/opencode-llama-swap-aio:latest"
           base=$(docker buildx imagetools inspect "$ref" --format '{{ index .Image.Config.Labels "org.opencode.base-digest" }}' 2>/dev/null || echo "")
           echo "digest=$base" >> "$GITHUB_OUTPUT"
-      - name: Comparar digests
+      - name: Compare digests
         id: compare
         run: |
           if [ "${{ steps.current.outputs.digest }}" != "${{ steps.published.outputs.digest }}" ]; then
-            echo "Nueva base detectada: ${{ steps.current.outputs.digest }} (publicada: ${{ steps.published.outputs.digest }})"
+            echo "New base detected: ${{ steps.current.outputs.digest }} (published: ${{ steps.published.outputs.digest }})"
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
-            echo "debian:13-slim sin cambios; no se reconstruye."
+            echo "debian:13-slim unchanged; skipping rebuild."
             echo "changed=false" >> "$GITHUB_OUTPUT"
           fi
 
   build:
     runs-on: ubuntu-latest
     needs: [check-base]
-    # Se construye en tags/PR/manual siempre, y en el cron solo si la base cambió.
+    # Always build on tags/PR/manual; on the cron, only if the base changed.
     if: |
       always() &&
       (github.event_name != 'schedule' || needs.check-base.outputs.changed == 'true')

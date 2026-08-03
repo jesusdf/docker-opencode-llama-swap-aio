@@ -17,10 +17,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN npm install -g opencode-ai \
     && npm cache clean --force
 
-# Install the Hugging Face download CLI (huggingface-cli / hf) + fast transfer
+# Install the Hugging Face download CLI (huggingface-cli / hf) + Xet fast transfer
 RUN pip install --no-cache-dir --break-system-packages \
-        "huggingface_hub[cli]" hf_transfer
-ENV HF_HUB_ENABLE_HF_TRANSFER=1
+        "huggingface_hub[cli,hf_xet]"
+ENV HF_XET_HIGH_PERFORMANCE=1
 
 # Harden SSH: key-only auth, no root login
 RUN mkdir -p /var/run/sshd \

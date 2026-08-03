@@ -36,11 +36,11 @@ if [ ${#existing[@]} -eq 0 ]; then
         apt-get update
         apt-get install -y --no-install-recommends python3 python3-pip
         rm -rf /var/lib/apt/lists/*
-        pip install --break-system-packages -q huggingface_hub hf_transfer \
-            || pip install -q huggingface_hub hf_transfer
+        pip install --break-system-packages -q "huggingface_hub[hf_xet]" \
+            || pip install -q "huggingface_hub[hf_xet]"
     fi
 
-    export HF_HUB_ENABLE_HF_TRANSFER=1
+    export HF_XET_HIGH_PERFORMANCE=1
     huggingface-cli download "$MODEL_REPO" \
         --include "*${MODEL_QUANT}*.gguf" "mmproj*.gguf" \
         --local-dir "$MODEL_DIR" \
