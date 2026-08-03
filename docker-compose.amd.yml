@@ -1,0 +1,50 @@
+services:
+  llama-swap:
+    image: ghcr.io/mostlygeek/llama-swap:rocm
+    container_name: llama-swap
+    restart: unless-stopped
+    env_file: .env
+    entrypoint: ["/bin/bash", "/app/init-llama-swap.sh"]
+    volumes:
+      - ./init-llama-swap.sh:/app/init-llama-swap.sh:ro
+      - ${MODELS_PATH}:/models
+    ports:
+      - "8080:8080"
+    # ROCm GPU passthrough
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+    security_opt:
+      - seccomp:unconfined
+    ipc: host
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      # First start may need to download the model — give it room.
+      start_period: 1800s
+    networks:
+      - opencode-net
+
+  opencode:
+    build: .
+    image: opencode-llama-swap
+    container_name: opencode
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ${USER_HOME_PATH}:/home/user
+    ports:
+      - "${SSH_PORT:-2222}:22"
+    depends_on:
+      llama-swap:
+        condition: service_healthy
+    networks:
+      - opencode-net
+
+networks:
+  opencode-net:
+    driver: bridge
