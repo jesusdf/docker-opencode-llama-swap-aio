@@ -1,4 +1,4 @@
-# docker-opencode-llama-swap-aio
+# opencode + llama-swap All In One 
 
 A ready-to-run stack that pairs [opencode](https://opencode.ai) (used as a coding
 agent over SSH) with [llama-swap](https://github.com/mostlygeek/llama-swap)
