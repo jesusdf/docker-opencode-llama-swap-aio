@@ -71,9 +71,3 @@ See [`.env.example`](.env.example) for all variables. Highlights:
 - `LLAMA_API_KEY` — protects the llama-swap API and is used by opencode.
 - `SSH_PUBLIC_KEY` — authorized key for SSH login.
 - `USER_HOME_PATH`, `MODELS_PATH` — host paths for persistence.
-
-## CI
-
-`.github/workflows/docker-image.yml` builds and pushes the opencode image
-(`linux/amd64`) to Docker Hub on pushes to `main` and `v*` tags. It requires the
-`DOCKER_USER` and `DOCKER_PASSWORD` repository secrets.

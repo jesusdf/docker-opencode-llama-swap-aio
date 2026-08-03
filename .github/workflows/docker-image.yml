@@ -41,5 +41,5 @@ jobs:
         with:
           username: ${{ secrets.DOCKER_USER }}
           password: ${{ secrets.DOCKER_PASSWORD }}
-          repository: ${{ github.repository_owner}}/docker-opencode-llama-swap-aio
+          repository: ${{ github.repository_owner }}/opencode-llama-swap-aio
           readme-filepath: ./README.md
