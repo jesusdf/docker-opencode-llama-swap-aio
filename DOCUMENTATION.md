@@ -60,7 +60,7 @@ parameters and SSH key are all driven by environment variables.
 
 | Variable | Example | Description |
 |---|---|---|
-| `USER_HOME_PATH` | `/home/docker/opencode_user` | Host path persisted as the user's `/home/user`. |
+| `USER_HOME_PATH` | `/home/docker/opencode` | Host path persisted as the user's `/home/user`. |
 | `MODELS_PATH` | `/home/docker/llama-swap/models` | Host path where downloaded models and the generated `config.yaml` live. |
 
 ### SSH
