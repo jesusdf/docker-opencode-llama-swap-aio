@@ -10,6 +10,7 @@ set -euo pipefail
 : "${LLAMA_API_KEY:=}"
 : "${LLAMA_SWAP_URL:=http://llama-swap:8080}"
 : "${SSH_PUBLIC_KEY:=}"
+: "${APT_PACKAGES:=}"
 
 # --- Align the 'user' account with the requested uid/gid ---
 CUR_UID="$(id -u user)"
@@ -20,6 +21,15 @@ CUR_GID="$(id -g user)"
 # --- Home directory ---
 mkdir -p "$USER_HOME_PATH"
 chown "$PUID:$PGID" "$USER_HOME_PATH"
+
+# --- Optional extra OS packages requested via APT_PACKAGES (space-separated) ---
+if [ -n "$APT_PACKAGES" ]; then
+    echo "Installing extra packages: $APT_PACKAGES"
+    apt-get update
+    # shellcheck disable=SC2086  # intentional word-splitting on spaces
+    apt-get install -y --no-install-recommends $APT_PACKAGES
+    rm -rf /var/lib/apt/lists/*
+fi
 
 # --- SSH authorized_keys ---
 if [ -n "$SSH_PUBLIC_KEY" ]; then

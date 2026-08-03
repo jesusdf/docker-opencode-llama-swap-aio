@@ -55,6 +55,7 @@ parameters and SSH key are all driven by environment variables.
 | `PUID` / `PGID` | `1000` / `1000` | uid/gid the `user` account is remapped to (matches host file ownership). |
 | `TZ` | `Europe/Madrid` | Container timezone. |
 | `LLAMA_SWAP_URL` | `http://llama-swap:8080` | Internal URL opencode uses to reach llama-swap (compose service name). |
+| `APT_PACKAGES` | `vim tmux ripgrep` | Extra Debian packages installed into the **opencode** container at boot (space-separated). Empty = install nothing. See [the customisation Q&A](#q-how-do-i-install-extra-packages-or-run-my-own-setup-in-the-opencode-container). |
 
 ### Host paths
 
@@ -234,6 +235,70 @@ docker compose -f docker-compose.nvidia.yml up -d
 
 Note the opencode config (`~/.config/opencode/opencode.json`) is only generated
 once. If you changed `MODEL_ID`, update that file or delete it to regenerate.
+
+---
+
+## Q: How do I install extra packages or run my own setup in the opencode container?
+
+**A:** There are two independent mechanisms; use either or both.
+
+### 1. Install OS packages with `APT_PACKAGES`
+
+Set `APT_PACKAGES` in `.env` to a **space-separated** list of Debian packages.
+On every boot, [`entrypoint.sh`](entrypoint.sh) runs `apt-get install` for them
+(as root, before `sshd` starts):
+
+```bash
+# .env
+APT_PACKAGES=vim tmux ripgrep htop
+```
+
+```bash
+docker compose -f docker-compose.nvidia.yml up -d
+```
+
+Notes:
+
+- The list is re-installed on **every** start. `apt-get` is idempotent, so
+  already-present packages are a fast no-op — the cost is one `apt-get update`.
+- Installation happens **before** SSH is available. A bad/unknown package name
+  makes `apt-get` fail and, because the entrypoint runs under `set -e`, aborts
+  container startup — check `docker compose logs opencode` if the container
+  won't come up.
+- This is for *system* packages only. It does not touch npm, pip, or per-user
+  config.
+
+### 2. Run your own setup via the mapped `~/.bashrc`
+
+The user's home directory is bind-mounted from the host (`USER_HOME_PATH` →
+`/home/user`), so it **persists across restarts and rebuilds**. Anything you put
+in `~/.bashrc` there runs on each interactive SSH login as `user` — the natural
+place for setup that doesn't need root or that you'd rather keep out of `.env`:
+
+```bash
+# on the host: $USER_HOME_PATH/.bashrc  (e.g. /home/docker/opencode/.bashrc)
+
+# per-user tools that don't need apt
+pipx install --quiet some-cli 2>/dev/null || true
+
+# environment / aliases
+export EDITOR=vim
+alias ll='ls -la'
+
+# one-shot bootstrap guarded by a sentinel so it only runs once
+if [ ! -f "$HOME/.setup-done" ]; then
+    git config --global user.name "Your Name"
+    touch "$HOME/.setup-done"
+fi
+```
+
+Because `user` has passwordless `sudo`, a `.bashrc` script can also install
+system packages (`sudo apt-get install -y ...`) if you prefer to keep everything
+in one place instead of `APT_PACKAGES`.
+
+**Which to use?** `APT_PACKAGES` for declarative system packages that belong in
+`.env` and should exist before login; `~/.bashrc` for per-user tooling, env
+vars, aliases, or richer bootstrap logic. They compose cleanly.
 
 ---
 

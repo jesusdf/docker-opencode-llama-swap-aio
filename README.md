@@ -71,3 +71,7 @@ See [`.env.example`](.env.example) for all variables. Highlights:
 - `LLAMA_API_KEY` — protects the llama-swap API and is used by opencode.
 - `SSH_PUBLIC_KEY` — authorized key for SSH login.
 - `USER_HOME_PATH`, `MODELS_PATH` — host paths for persistence.
+- `APT_PACKAGES` — extra Debian packages (space-separated) installed into the
+  opencode container at boot. For richer per-user setup you can also edit
+  `~/.bashrc` in the mapped home directory — see
+  [`DOCUMENTATION.md`](DOCUMENTATION.md#q-how-do-i-install-extra-packages-or-run-my-own-setup-in-the-opencode-container).
