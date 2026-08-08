@@ -41,7 +41,7 @@ if [ ${#existing[@]} -eq 0 ]; then
     fi
 
     export HF_XET_HIGH_PERFORMANCE=1
-    huggingface-cli download "$MODEL_REPO" \
+    hf download "$MODEL_REPO" \
         --include "*${MODEL_QUANT}*.gguf" "mmproj*.gguf" \
         --local-dir "$MODEL_DIR" \
         ${HF_TOKEN:+--token "$HF_TOKEN"}
