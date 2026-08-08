@@ -30,11 +30,20 @@ services:
       - opencode-net
 
   opencode:
-    build: .
-    image: opencode-llama-swap
+    # Published image. To build it locally instead, add the build override:
+    #   docker compose -f docker-compose.amd.yml -f docker-compose.build.yml up -d --build
+    image: jesusdf/opencode-llama-swap-aio:latest
     container_name: opencode
     restart: unless-stopped
     env_file: .env
+    # The image has no sudo; this also strips the setuid bit's effect, so no
+    # binary inside the container can grant privileges the process lacks.
+    security_opt:
+      - no-new-privileges:true
+    # Needed only by BLOCK_LOCAL_NETWORK, so the entrypoint can install the
+    # egress iptables rules. Harmless otherwise: the SSH user is never root.
+    cap_add:
+      - NET_ADMIN
     volumes:
       - ${USER_HOME_PATH}:/home/user
       # Root-run init hook. Read-only on purpose: the container user has no sudo

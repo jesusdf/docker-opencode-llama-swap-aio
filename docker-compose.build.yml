@@ -1,0 +1,17 @@
+# Build override — for developing this repo, not for end users.
+#
+# The GPU compose files pull the published image. Stack this one on top of
+# either of them to build the opencode image from the local Dockerfile instead:
+#
+#   docker compose -f docker-compose.nvidia.yml -f docker-compose.build.yml up -d --build
+#   docker compose -f docker-compose.amd.yml    -f docker-compose.build.yml up -d --build
+#
+# The image name is kept identical to the published one so the rest of the
+# configuration (and `docker compose down`) behaves the same either way.
+services:
+  opencode:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: jesusdf/opencode-llama-swap-aio:latest
+    pull_policy: build

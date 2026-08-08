@@ -1,19 +1,20 @@
 #!/bin/bash
 set -euo pipefail
 
-: "${USER_HOME_PATH:=/home/user}"
 : "${PUID:=1000}"
 : "${PGID:=1000}"
 : "${MODEL_ID:=model}"
 : "${CTX_SIZE:=262144}"
 : "${N_PREDICT:=8192}"
 : "${REASONING_EFFORT:=high}"
+: "${REASONING_ENABLED:=auto}"
 : "${REGENERATE_OPENCODE_CONFIG:=false}"
 : "${LLAMA_API_KEY:=}"
 : "${LLAMA_SWAP_URL:=http://llama-swap:8080}"
 : "${SSH_PUBLIC_KEY:=}"
 : "${APT_PACKAGES:=}"
 : "${INIT_SCRIPT:=/opt/init/init.sh}"
+: "${BLOCK_LOCAL_NETWORK:=false}"
 
 # --- Align the 'user' account with the requested uid/gid ---
 CUR_UID="$(id -u user)"
@@ -22,6 +23,14 @@ CUR_GID="$(id -g user)"
 [ "$PUID" != "$CUR_UID" ] && usermod  -o -u "$PUID" user
 
 # --- Home directory ---
+# Always resolve the home from the passwd entry, never from the environment:
+# USER_HOME_PATH in .env is the *host* path used as the bind-mount source, and
+# compose also injects it into the container via env_file. Trusting it here made
+# the entrypoint write .ssh/authorized_keys and opencode.json to a host path that
+# does not exist inside the container, while sshd kept reading /home/user.
+USER_HOME_PATH="$(getent passwd user | cut -d: -f6)"
+export USER_HOME_PATH
+echo "Using home directory $USER_HOME_PATH"
 mkdir -p "$USER_HOME_PATH"
 chown "$PUID:$PGID" "$USER_HOME_PATH"
 
@@ -44,6 +53,17 @@ else
     echo "WARNING: SSH_PUBLIC_KEY is empty — no one will be able to log in over SSH." >&2
 fi
 
+# --- Wait for llama-swap (belt-and-suspenders; compose already gates on healthcheck) ---
+echo "Waiting for llama-swap at ${LLAMA_SWAP_URL}/health ..."
+for _ in $(seq 1 60); do
+    if curl -fsS --max-time 5 "${LLAMA_SWAP_URL}/health" >/dev/null 2>&1; then
+        echo "llama-swap is ready."
+        break
+    fi
+    printf '.'
+    sleep 5
+done
+
 # --- opencode config ---
 # Generated once and then left for the user to edit, unless
 # REGENERATE_OPENCODE_CONFIG is truthy, in which case it is rewritten on every
@@ -60,36 +80,191 @@ if [ ! -f "$OPENCODE_CFG" ] || [ "$REGEN_CFG" = 1 ]; then
     else
         echo "Creating default opencode config at $OPENCODE_CFG ..."
     fi
-    install -d -o "$PUID" -g "$PGID" "$OPENCODE_CFG_DIR"
-    cat > "$OPENCODE_CFG" <<JSON
-{
-  "\$schema": "https://opencode.ai/config.json",
-  "provider": {
-    "llamaswap": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "llama-swap",
-      "options": {
-        "baseURL": "${LLAMA_SWAP_URL}/v1",
-        "apiKey": "${LLAMA_API_KEY}"
-      },
-      "models": {
-        "swap/${MODEL_ID}": {
-          "name": "${MODEL_ID}",
-          "limit": { "context": ${CTX_SIZE}, "output": ${N_PREDICT} },
-          "tools": true,
-          "options": {
-            "reasoningEffort": "${REASONING_EFFORT}"
-          }
-        }
-      }
-    }
-  },
-  "model": "llamaswap/swap/${MODEL_ID}",
-  "small_model": "llamaswap/swap/${MODEL_ID}",
-  "autoshare": false
+    # Both components, so ~/.config does not end up owned by root and unusable
+    # for anything else the user wants to put there.
+    install -d -o "$PUID" -g "$PGID" "$USER_HOME_PATH/.config" "$OPENCODE_CFG_DIR"
+
+    # llama-swap serves every model found under /models, not just MODEL_ID, so
+    # ask it what it actually has instead of assuming. Falls back to MODEL_ID
+    # alone if the query fails (llama-swap down, wrong key, no python3).
+    AUTH=()
+    [ -n "$LLAMA_API_KEY" ] && AUTH=(-H "Authorization: Bearer ${LLAMA_API_KEY}")
+    MODEL_LIST=""
+    if MODELS_JSON="$(curl -fsS --max-time 10 "${AUTH[@]}" "${LLAMA_SWAP_URL}/v1/models" 2>/dev/null)"; then
+        MODEL_LIST="$(printf '%s' "$MODELS_JSON" | python3 -c \
+            'import json,sys; print("\n".join(m["id"] for m in json.load(sys.stdin).get("data",[]) if m.get("id")))' \
+            2>/dev/null || true)"
+    fi
+    if [ -n "$MODEL_LIST" ]; then
+        # grep -c, not wc -l: the last id has no trailing newline.
+        echo "Discovered $(printf '%s' "$MODEL_LIST" | grep -c .) model(s) from llama-swap."
+    else
+        echo "WARNING: could not list models from llama-swap — using MODEL_ID only." >&2
+        MODEL_LIST="swap/${MODEL_ID}"
+    fi
+
+    case "${REASONING_ENABLED,,}" in
+        1|true|yes|on)  REASONING_MODE=true ;;
+        0|false|no|off) REASONING_MODE=false ;;
+        *)              REASONING_MODE=auto ;;
+    esac
+
+    # Every value the generator reads has to be exported: the defaults above are
+    # plain shell variables, not part of the environment.
+    MODEL_LIST="$MODEL_LIST" DEFAULT_MODEL="swap/${MODEL_ID}" \
+    CTX_SIZE="$CTX_SIZE" N_PREDICT="$N_PREDICT" REASONING_EFFORT="$REASONING_EFFORT" \
+    REASONING_MODE="$REASONING_MODE" \
+    LLAMA_SWAP_URL="$LLAMA_SWAP_URL" LLAMA_API_KEY="$LLAMA_API_KEY" \
+    python3 > "$OPENCODE_CFG" <<'PY'
+import json, os
+
+ids = [m for m in os.environ["MODEL_LIST"].splitlines() if m.strip()]
+default = os.environ["DEFAULT_MODEL"]
+# Keep MODEL_ID as the default when it is actually being served, otherwise fall
+# back to whatever llama-swap listed first.
+if default not in ids:
+    default = ids[0]
+
+# Reasoning controls.
+#
+# `reasoningEffort` alone is a no-op against llama.cpp: the provider turns it
+# into a top-level `reasoning_effort` field, which llama-server accepts and then
+# silently drops — it never reaches the chat template. What the template does
+# see is `chat_template_kwargs`, and unknown keys in this options dict are
+# forwarded verbatim as top-level request fields, so that is how we pass it.
+#
+# `enable_thinking` is the boolean most thinking models use (Qwen3, DeepSeek-R1,
+# GLM…); `reasoning_effort` is what the gpt-oss family reads. Sending both costs
+# nothing — a template simply ignores the variable it does not use.
+effort = os.environ["REASONING_EFFORT"]
+mode = os.environ["REASONING_MODE"]
+
+if mode == "false":
+    # Off: don't advertise an effort level we are also disabling.
+    model_options = {"chat_template_kwargs": {"enable_thinking": False}}
+else:
+    kwargs = {"reasoning_effort": effort}
+    if mode == "true":
+        kwargs["enable_thinking"] = True
+    # `reasoningEffort` is kept as well: harmless here, and correct if this
+    # config is ever pointed at a provider that does honour it.
+    model_options = {"reasoningEffort": effort, "chat_template_kwargs": kwargs}
+
+# Attachments are advertised for every model, unconditionally.
+#
+# opencode treats a custom-provider model as text-only unless it declares these,
+# and this container cannot tell which models are multimodal anyway: it never
+# sees /models, only the list of ids from llama-swap. Declaring them everywhere
+# means the option is always offered; if the model has no projector, the request
+# simply fails at llama-server, which is a clearer outcome than the attachment
+# button never appearing.
+#
+# `image` and `audio` are the two llama.cpp actually handles (both through the
+# same mmproj); video and pdf are deliberately left out.
+capabilities = {
+    "attachment": True,
+    "modalities": {"input": ["text", "image", "audio"], "output": ["text"]},
+    # The documented capability field is `tool_call`; `tools` is not part of the
+    # model schema and was being ignored.
+    "tool_call": True,
 }
-JSON
+
+models = {
+    mid: {
+        "name": mid.split("/", 1)[-1],
+        "limit": {
+            "context": int(os.environ["CTX_SIZE"]),
+            "output": int(os.environ["N_PREDICT"]),
+        },
+        **capabilities,
+        "options": model_options,
+    }
+    for mid in ids
+}
+
+print(json.dumps({
+    "$schema": "https://opencode.ai/config.json",
+    "provider": {
+        "llamaswap": {
+            "npm": "@ai-sdk/openai-compatible",
+            "name": "llama-swap",
+            "options": {
+                "baseURL": os.environ["LLAMA_SWAP_URL"] + "/v1",
+                "apiKey": os.environ["LLAMA_API_KEY"],
+            },
+            "models": models,
+        }
+    },
+    "model": "llamaswap/" + default,
+    "small_model": "llamaswap/" + default,
+    "autoshare": False,
+}, indent=2))
+PY
     chown "$PUID:$PGID" "$OPENCODE_CFG"
+fi
+
+# --- Egress firewall (optional) ---
+# Keeps the agent from reaching the rest of the LAN while leaving the internet
+# open. Applied BEFORE the init hook on purpose, so the operator's script can
+# append its own exceptions (or flush the chain entirely).
+# Requires NET_ADMIN on the container; without it iptables cannot write rules.
+case "${BLOCK_LOCAL_NETWORK,,}" in
+    1|true|yes|on) BLOCK_LAN=1 ;;
+    *)             BLOCK_LAN=0 ;;
+esac
+if [ "$BLOCK_LAN" = 1 ]; then
+    # RFC1918 plus link-local, which carries the cloud metadata endpoint
+    # (169.254.169.254) — a well-known way to reach credentials.
+    PRIVATE_NETS="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16"
+
+    if ! command -v iptables >/dev/null 2>&1; then
+        echo "ERROR: BLOCK_LOCAL_NETWORK is set but iptables is missing — LAN is NOT blocked." >&2
+    elif ! iptables -L OUTPUT -n >/dev/null 2>&1; then
+        echo "ERROR: BLOCK_LOCAL_NETWORK is set but iptables cannot run — LAN is NOT blocked." >&2
+        echo "       Add NET_ADMIN to the container (cap_add: [NET_ADMIN] in compose)." >&2
+    else
+        echo "Blocking local network egress (BLOCK_LOCAL_NETWORK is set) ..."
+
+        # Loopback and replies to already-accepted connections (this is what
+        # keeps inbound SSH working, since its reply packets traverse OUTPUT).
+        iptables -A OUTPUT -o lo -j ACCEPT
+        iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+        # llama-swap sits on the compose bridge, inside 172.16.0.0/12, so it has
+        # to be allowed explicitly before the private-range rejects below.
+        SWAP_HOSTPORT="${LLAMA_SWAP_URL#*://}"; SWAP_HOSTPORT="${SWAP_HOSTPORT%%/*}"
+        SWAP_HOST="${SWAP_HOSTPORT%%:*}"
+        SWAP_PORT="${SWAP_HOSTPORT##*:}"
+        [ "$SWAP_PORT" = "$SWAP_HOST" ] && SWAP_PORT=80
+        SWAP_IPS="$(getent ahostsv4 "$SWAP_HOST" 2>/dev/null | awk '{print $1}' | sort -u)"
+        if [ -n "$SWAP_IPS" ]; then
+            for ip in $SWAP_IPS; do
+                echo "  allowing llama-swap at ${ip}:${SWAP_PORT}"
+                iptables -A OUTPUT -d "$ip" -p tcp --dport "$SWAP_PORT" -j ACCEPT
+            done
+        else
+            echo "WARNING: could not resolve '$SWAP_HOST' — allowing the whole bridge subnet instead." >&2
+            # Fall back to the container's own /16 so the stack still works.
+            BRIDGE_NET="$(ip -4 -o addr show scope global | awk '{print $4}' | head -1)"
+            [ -n "$BRIDGE_NET" ] && iptables -A OUTPUT -d "$BRIDGE_NET" -j ACCEPT
+        fi
+
+        for net in $PRIVATE_NETS; do
+            iptables -A OUTPUT -d "$net" -j REJECT --reject-with icmp-admin-prohibited
+        done
+
+        # Same treatment for IPv6 (unique-local + link-local). Best effort: many
+        # setups run IPv6-less containers where ip6tables has nothing to do.
+        if command -v ip6tables >/dev/null 2>&1 && ip6tables -L OUTPUT -n >/dev/null 2>&1; then
+            ip6tables -A OUTPUT -o lo -j ACCEPT
+            ip6tables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+            for net in fc00::/7 fe80::/10; do
+                ip6tables -A OUTPUT -d "$net" -j REJECT --reject-with adm-prohibited || true
+            done
+        fi
+
+        echo "Egress rules in place; everything outside the private ranges is still reachable."
+    fi
 fi
 
 # --- Operator init hook (runs as root, before dropping into sshd) ---
@@ -118,17 +293,6 @@ if [ -e "$INIT_SCRIPT" ]; then
         fi
     fi
 fi
-
-# --- Wait for llama-swap (belt-and-suspenders; compose already gates on healthcheck) ---
-echo "Waiting for llama-swap at ${LLAMA_SWAP_URL}/health ..."
-for _ in $(seq 1 60); do
-    if curl -fsS --max-time 5 "${LLAMA_SWAP_URL}/health" >/dev/null 2>&1; then
-        echo "llama-swap is ready."
-        break
-    fi
-    printf '.'
-    sleep 5
-done
 
 # --- Run SSH in the foreground as the container's main process ---
 exec /usr/sbin/sshd -D -e

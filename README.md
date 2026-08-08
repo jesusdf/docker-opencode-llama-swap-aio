@@ -30,10 +30,17 @@ cp .env.example .env
 # edit .env: set MODEL_REPO/MODEL_QUANT, LLAMA_API_KEY, SSH_PUBLIC_KEY, paths…
 
 # NVIDIA (CUDA):
-docker compose -f docker-compose.nvidia.yml up -d --build
+docker compose -f docker-compose.nvidia.yml up -d
 
 # AMD (ROCm):
-docker compose -f docker-compose.amd.yml up -d --build
+docker compose -f docker-compose.amd.yml up -d
+```
+
+These pull the published image `jesusdf/opencode-llama-swap-aio`. To build it
+from this repo instead, stack the build override on top:
+
+```bash
+docker compose -f docker-compose.nvidia.yml -f docker-compose.build.yml up -d --build
 ```
 
 The first boot downloads the model, so llama-swap may take a while to become
@@ -68,17 +75,27 @@ See [`.env.example`](.env.example) for all variables. Highlights:
 
 - `MODEL_REPO` / `MODEL_QUANT` — Hugging Face GGUF repo and quant pattern to
   download (multimodal `mmproj*` files are picked up automatically).
-- `MODEL_ID` — internal name used for both the llama-swap model
-  (`swap/<MODEL_ID>`) and the opencode model.
+- `MMPROJ_QUANT` — which multimodal projector to fetch when a repo ships several
+  (default `F16`); empty downloads them all.
+- `MODEL_ID` — name of the model directory under `MODELS_PATH`, and the default
+  model in opencode. It only controls what gets *downloaded*: llama-swap serves
+  every model directory it finds, and opencode is configured with all of them.
 - `CTX_SIZE`, `N_PREDICT`, `KV_CACHE_TYPE`, `MODEL_TTL`, `TEMP`, `TOP_P`,
   `TOP_K` — inference parameters.
-- `REASONING_EFFORT` — reasoning level (`low`, `medium`, `high`) written into the
-  generated opencode model options.
+- `REASONING_ENABLED` / `REASONING_EFFORT` — whether the model thinks
+  (`auto`/`true`/`false`) and how hard (`low`/`medium`/`high`). Applied to both
+  llama-server (`--reasoning`) and opencode (`chat_template_kwargs`).
+- `N_GPU_LAYERS`, `CPU_MOE`, `N_CPU_MOE`, `OVERRIDE_TENSOR`, `KV_OFFLOAD`,
+  `EXTRA_LLAMA_ARGS` — VRAM tuning for models that barely fit; defaults keep
+  everything on the GPU. See
+  [`DOCUMENTATION.md`](DOCUMENTATION.md#q-the-model-barely-fits-in-vram-what-can-i-offload-to-ram).
 - `REGENERATE_OPENCODE_CONFIG` — set to `true` to rewrite `opencode.json` on
   every start (manual edits are lost); `false` generates it only if missing.
 - `LLAMA_API_KEY` — protects the llama-swap API and is used by opencode.
 - `SSH_PUBLIC_KEY` — authorized key for SSH login.
 - `USER_HOME_PATH`, `MODELS_PATH` — host paths for persistence.
+- `BLOCK_LOCAL_NETWORK` — when `true`, blocks egress to the LAN (RFC1918 plus
+  link-local) while leaving the internet and llama-swap reachable.
 - `INIT_SCRIPT` / `INIT_PATH` — root-run hook. `INIT_PATH` is mounted read-only
   at `/opt/init`; if `INIT_SCRIPT` (default `/opt/init/init.sh`) exists it is
   executed as root at boot. Refused if the container user can write to it. See

@@ -345,6 +345,319 @@ container, so a broken hook can't lock you out of SSH.
 
 ---
 
+## Q: How do I serve more than one model?
+
+**A:** Just put it in `MODELS_PATH`. Every subdirectory of `/models` containing a
+GGUF becomes a model, named after the directory:
+
+```
+/models/
+  gemma4-12b/    gemma-4-12b-it-UD-Q4_K_XL.gguf        -> swap/gemma4-12b
+  qwen-coder/    qwen-coder-Q8_0.gguf                  -> swap/qwen-coder
+  big-70b/       big-70b-…-00001-of-00003.gguf         -> swap/big-70b
+                 mmproj-F16.gguf                          (vision, auto-attached)
+```
+
+`MODEL_REPO`/`MODEL_QUANT`/`MODEL_ID` only decide what gets **downloaded** on
+first boot; anything already sitting in `/models` is picked up too. To add a
+model, download it into its own directory and restart llama-swap.
+
+Per directory the entrypoint prefers the first shard of a split GGUF, prefers
+`MODEL_QUANT` when several quants coexist, and ignores `mmproj*` when choosing
+the model file (it is the vision projector, attached via `--mmproj` instead).
+
+All models go into one `exclusive` swap group, since a single GPU can only hold
+one at a time — llama-swap unloads the current one before starting another.
+
+On the opencode side, `entrypoint.sh` asks llama-swap's `/v1/models` what is
+actually being served and writes every model into `opencode.json`, so you can
+switch between them from the model picker. `MODEL_ID` stays the default. Note
+the config is only regenerated when it is missing or when
+`REGENERATE_OPENCODE_CONFIG=true` — set that after adding models.
+
+---
+
+## Q: The model barely fits in VRAM. What can I offload to RAM?
+
+**A:** There is a dedicated variable per lever. All defaults keep everything on
+the GPU, which is what the stack did before these existed.
+
+| Variable | llama-server flag | What it does |
+|---|---|---|
+| `CTX_SIZE` | `--ctx-size` | **Try this first.** At large context the KV cache costs more VRAM than the weights. |
+| `N_GPU_LAYERS` | `-ngl` | Layers kept in VRAM. `99` = all. Lower it to push the rest to RAM. Simplest lever, costliest in speed. |
+| `CPU_MOE` | `-cmoe` | MoE models: **all** expert weights to RAM, attention stays on GPU. |
+| `N_CPU_MOE` | `-ncmoe N` | Same, but only the first N layers' experts. Finer grained. |
+| `OVERRIDE_TENSOR` | `-ot` | Placement by tensor-name regex, when the above are too coarse. |
+| `KV_OFFLOAD` | `-nkvo` | `false` keeps the KV cache in RAM. Frees a lot, usually a big slowdown. |
+| `KV_CACHE_TYPE` | `-ctk`/`-ctv` | KV quantisation. `q8_0` default; `q4_0` halves it with some quality loss. |
+| `EXTRA_LLAMA_ARGS` | *(verbatim)* | Escape hatch for flags with no variable here. |
+
+For a **MoE** model, `CPU_MOE`/`N_CPU_MOE` beats lowering `N_GPU_LAYERS`: the
+experts are the bulk of the weights but only a few are active per token, so
+parking them in RAM costs far less speed than evicting whole layers.
+
+### Example 1 — dense model, 100 % in VRAM
+
+`gemma4-12b` at a modest context fits on a 24 GB card with everything on the GPU.
+This is also exactly the default configuration:
+
+```bash
+MODEL_REPO=unsloth/gemma-4-12b-it-GGUF
+MODEL_QUANT=UD-Q4_K_XL
+MODEL_ID=gemma4-12b
+
+CTX_SIZE=32768          # the single biggest VRAM lever
+KV_CACHE_TYPE=q8_0
+N_GPU_LAYERS=99         # all layers on the GPU
+KV_OFFLOAD=true         # KV cache on the GPU too
+CPU_MOE=false           # dense model: nothing to offload
+N_CPU_MOE=
+OVERRIDE_TENSOR=
+```
+
+### Example 2 — MoE model, experts in RAM
+
+`Qwen3.6-35B-A3B` is a Mixture-of-Experts model: 35 B total parameters but only
+~3 B active per token. The experts are most of the weight and are what you want
+in RAM:
+
+```bash
+MODEL_REPO=unsloth/Qwen3.6-35B-A3B-GGUF
+MODEL_QUANT=UD-Q3_K_XL
+MODEL_ID=qwen36-35b-a3b
+
+CTX_SIZE=32768
+KV_CACHE_TYPE=q8_0
+N_GPU_LAYERS=99         # keep attention + non-expert tensors on the GPU
+CPU_MOE=true            # -cmoe: all expert weights to RAM
+KV_OFFLOAD=true
+```
+
+Still short on VRAM? Trade back gradually, in this order: swap `CPU_MOE=true`
+for `N_CPU_MOE=<N>` and tune N (only the first N layers' experts go to RAM, the
+rest stay on the GPU — raise N until it fits); then lower `CTX_SIZE`; then
+`KV_CACHE_TYPE=q4_0`; and only then `N_GPU_LAYERS`.
+
+**One caveat:** these variables are global — they apply to every model
+llama-swap serves, not per model. If you keep both examples above in the same
+`/models` directory, `CPU_MOE=true` is the setting to use: it is a no-op on a
+dense model (verified — `-cmoe` starts fine against a dense GGUF, there are
+simply no expert tensors to move), so gemma still runs fully on the GPU while
+Qwen's experts go to RAM. `N_GPU_LAYERS` and `CTX_SIZE`, by contrast, hit both.
+
+---
+
+## Q: Does vision / multimodal work?
+
+**A:** On the llama-swap side, yes, and automatically. If a model directory
+contains an `mmproj*.gguf` next to the GGUF, `init-llama-swap.sh` attaches it
+with `--mmproj` and llama-server serves images through the OpenAI-compatible
+API. Verified end to end: an image posted to `/v1/chat/completions` as an
+`image_url` content part is described correctly.
+
+The projector is downloaded along with the model, so for a multimodal repo like
+`unsloth/gemma-4-12b-it-GGUF` you get it without doing anything.
+
+### Choosing the projector: `MMPROJ_QUANT`
+
+Repos often ship several projectors — unsloth publishes `mmproj-BF16.gguf`,
+`mmproj-F16.gguf` and `mmproj-F32.gguf`. `MMPROJ_QUANT` (default `F16`) picks
+one instead of downloading all three and using whichever sorts first.
+
+Matching is **case-insensitive** and **boundary-aware**, which matters more than
+it sounds:
+
+- Case: unsloth writes `F16`, ggml-org `mmproj-model-f16.gguf`, bartowski
+  `mmproj-google_gemma-3-12b-it-f16.gguf`. One value covers all three.
+- Boundary: a naive `*F16*` also matches `mmproj-**BF**16.gguf`, so you would
+  still download the extra projector this variable exists to avoid. The quant
+  must be preceded by `-`, `_` or `.`.
+
+Set it empty to go back to downloading every projector in the repo.
+
+If a directory has projectors but none matching `MMPROJ_QUANT`, the first
+available one is used and the reason is logged:
+
+```
+>> NOTE: no mmproj matching 'F16' in /models/foo, using mmproj-BF16.gguf
+```
+
+That fallback is deliberate: a model downloaded before this variable existed
+keeps its vision instead of silently losing it.
+
+On the opencode side, the generated `opencode.json` declares every model as
+attachment-capable:
+
+```json
+"attachment": true,
+"modalities": { "input": ["text", "image", "audio"], "output": ["text"] }
+```
+
+This is unconditional and deliberate. The opencode container never sees
+`/models` — it only learns model *ids* from llama-swap's `/v1/models` — so it
+cannot tell which models have a projector. Advertising the capability
+everywhere means the attachment option is always available; against a model with
+no projector the request just fails at llama-server, which is a more useful
+outcome than the option silently never appearing. `video` and `pdf` are left
+out because llama.cpp does not handle them.
+
+Without these fields opencode treats a custom-provider model as text-only, which
+is why they matter — the capability is off by default.
+
+**Caveat worth knowing:** `opencode run` (the non-interactive CLI) does **not**
+expand `@file` mentions into attachments — the path is sent as literal text, so
+the model never sees the image regardless of the config above. Attaching images
+is an interactive-TUI path. opencode is primarily a text tool; treat multimodal
+input as a bonus rather than a supported workflow here.
+
+---
+
+## Q: How do I control whether the model "thinks"? (REASONING_ENABLED)
+
+**A:** `REASONING_ENABLED` takes `auto` (default, the template decides), `true`,
+or `false`, and `REASONING_EFFORT` takes `low`/`medium`/`high`. Both are applied
+on **both** sides of the stack, because neither alone is enough:
+
+- **llama-server** gets `--reasoning on|off` (nothing for `auto`, which is its
+  own default).
+- **opencode** gets `chat_template_kwargs` in the model options —
+  `enable_thinking` (the boolean Qwen3, DeepSeek-R1 and GLM templates read) and
+  `reasoning_effort` (what the gpt-oss family reads). Templates ignore whichever
+  variable they don't use, so sending both is free.
+
+### Why not just `reasoningEffort`?
+
+Because it does nothing against llama.cpp. opencode's `@ai-sdk/openai-compatible`
+provider turns a model's `options.reasoningEffort` into a **top-level**
+`reasoning_effort` request field, and llama-server accepts that field without
+error and then silently drops it — it never reaches the chat template, not even
+with an invalid value. Only `chat_template_kwargs` gets through.
+
+What makes this work is that the provider forwards **unknown** keys in `options`
+verbatim as top-level request fields, so `chat_template_kwargs` declared there
+lands in the request body as-is. `reasoningEffort` is still emitted alongside it:
+harmless for llama.cpp, and correct if the config is ever pointed at a provider
+that honours it.
+
+So the generated `opencode.json` looks like this for `REASONING_ENABLED=true`:
+
+```json
+"options": {
+  "reasoningEffort": "high",
+  "chat_template_kwargs": { "reasoning_effort": "high", "enable_thinking": true }
+}
+```
+
+and like this for `false` (no point advertising an effort level you're disabling):
+
+```json
+"options": { "chat_template_kwargs": { "enable_thinking": false } }
+```
+
+Remember `opencode.json` is only regenerated when missing or when
+`REGENERATE_OPENCODE_CONFIG=true` — set that after changing either variable.
+
+Related server-side flags, reachable through `EXTRA_LLAMA_ARGS`:
+`--reasoning-budget N` (cap thinking tokens) and `--reasoning-format`
+(`deepseek` puts thoughts in `message.reasoning_content`, `none` leaves them
+inline in the content).
+
+---
+
+## Q: How do I stop the agent from reaching the rest of my LAN?
+
+**A:** Set `BLOCK_LOCAL_NETWORK=true`. The entrypoint then installs iptables
+rules on the OUTPUT chain that reject traffic to:
+
+| Range             | What it is                                    |
+|-------------------|-----------------------------------------------|
+| `10.0.0.0/8`      | RFC1918 private                               |
+| `172.16.0.0/12`   | RFC1918 private                               |
+| `192.168.0.0/16`  | RFC1918 private                               |
+| `169.254.0.0/16`  | link-local, incl. cloud metadata (`169.254.169.254`) |
+
+The IPv6 equivalents (`fc00::/7`, `fe80::/10`) are handled too when IPv6 is
+available. Everything else — the whole internet — stays reachable, and so does
+llama-swap: it lives on the compose bridge inside `172.16.0.0/12`, so its
+address is resolved at boot and allowed explicitly *before* the reject rules.
+Inbound SSH keeps working because reply traffic matches the ESTABLISHED rule.
+
+This needs `NET_ADMIN`, already present in both compose files. Without it the
+entrypoint logs an error and starts anyway with the LAN **not** blocked — check
+the logs rather than assuming.
+
+The unprivileged user cannot undo any of this: changing iptables needs
+`CAP_NET_ADMIN`, which only the root entrypoint has, and there is no sudo.
+
+To adjust the policy, use the `INIT_SCRIPT` hook — it runs as root *after* the
+firewall is set up, precisely so it can amend it:
+
+```bash
+# /opt/init/init.sh — allow one specific host on the LAN
+iptables -I OUTPUT 4 -d 192.168.1.50 -p tcp --dport 443 -j ACCEPT
+```
+
+Note DNS keeps working because Docker's resolver lives on `127.0.0.11`
+(loopback). If you point the container at a DNS server on your LAN instead, add
+an exception for it, or name resolution will break.
+
+---
+
+## Q: Can the SSH user become root inside the container?
+
+**A:** No, by design. The container is reachable over SSH by whoever holds the
+key, so the account it lands on is treated as untrusted:
+
+- **No sudo.** It is not installed, is explicitly purged at build time, and
+  `/etc/sudoers.d` is removed. There is no sudoers entry for `user`.
+- **No root password**, so `su` cannot be used either (root's shadow entry is
+  locked in the base image).
+- **`no-new-privileges:true`** on the opencode service in both compose files.
+  This is what neutralises the setuid binaries Debian ships (`su`, `passwd`,
+  `mount`, …): with `NoNewPrivs` set, executing them cannot raise privileges.
+  The flag is inherited by every process in the container, SSH sessions
+  included — verify with `grep NoNewPrivs /proc/self/status` after logging in.
+- **The root-run hook is not user-writable.** `entrypoint.sh` refuses to execute
+  `$INIT_SCRIPT` if `user` can write to it or its directory, which is what stops
+  the hook from becoming an escalation path. See the `INIT_SCRIPT` question above.
+
+Root-level changes are therefore driven from the host, through `.env`:
+`APT_PACKAGES` for packages, `INIT_SCRIPT` for everything else. For one-off
+debugging you can always take a root shell from the host with
+`docker exec -u 0 -it opencode bash` — that path is controlled by whoever can
+talk to the Docker daemon, not by the SSH user.
+
+Note this hardens the account *inside* the container; it is not a sandbox
+boundary for the host. Standard container practice still applies (don't expose
+port 22 to the internet unnecessarily, keep the private key safe).
+
+---
+
+## Q: Which compose file do I use — and how do I build the image myself?
+
+**A:** The two GPU files are for **end users** and pull the published image:
+
+```bash
+docker compose -f docker-compose.nvidia.yml up -d     # CUDA
+docker compose -f docker-compose.amd.yml    up -d     # ROCm
+```
+
+`docker-compose.build.yml` is a **build override** for developing this repo.
+Stack it on top of either GPU file to build from the local `Dockerfile`:
+
+```bash
+docker compose -f docker-compose.nvidia.yml -f docker-compose.build.yml up -d --build
+```
+
+It sets the same image name (`jesusdf/opencode-llama-swap-aio:latest`) plus
+`pull_policy: build`, so the local build wins and everything else — volumes,
+ports, capabilities — is inherited unchanged from the GPU file. Keeping the
+build in a separate file is why the two GPU files stay identical apart from the
+image tag and the GPU passthrough block.
+
+---
+
 ## Q: How does CI build the image?
 
 **A:** [`.github/workflows/docker-image.yml`](.github/workflows/docker-image.yml)
