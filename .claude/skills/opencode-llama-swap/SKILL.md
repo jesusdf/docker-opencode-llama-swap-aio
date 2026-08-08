@@ -31,13 +31,139 @@ nothing about the model is hardcoded.
 
 | File | Role |
 |---|---|
-| `Dockerfile` | Builds the opencode image (node/npm + opencode, openssh, git, python3+`huggingface_hub[cli,hf_xet]`). Key-only SSH, no root login. |
+| `Dockerfile` | Two stages. Stage 1 compiles opencode from source with bun; stage 2 is the runtime image (openssh, git, nodejs, python3+`huggingface_hub[cli,hf_xet]`). Key-only SSH, no root login. |
 | `entrypoint.sh` | Remaps `user` to PUID/PGID, installs `authorized_keys`, generates `~/.config/opencode/opencode.json` (once), waits for llama-swap `/health`, then `exec sshd -D -e`. |
 | `init-llama-swap.sh` | Runs *inside the upstream llama-swap image*. Downloads GGUF from HF if missing, resolves the model file (+shards +mmproj), generates `/models/config.yaml`, `exec llama-swap ...`. |
 | `docker-compose.nvidia.yml` | CUDA image + `deploy.resources` nvidia device reservation. |
 | `docker-compose.amd.yml` | ROCm image + `/dev/kfd`,`/dev/dri` passthrough, `group_add: video`, `seccomp:unconfined`, `ipc: host`. |
 | `.env.example` | The full variable schema. Source of truth for what compose reads. |
 | `.github/workflows/docker-image.yml` | Builds/pushes the opencode image (linux/amd64) to Docker Hub. |
+
+## opencode is compiled from source, not installed from npm
+
+### Why
+
+`npm install -g opencode-ai` does not install JavaScript. It drops a ~183 MB
+Bun **standalone binary** (`bin/opencode.exe`) that carries OpenTUI's native
+`libopentui.so` *embedded*. Starting the TUI makes Bun unpack that library into
+a temporary directory and `dlopen` it, and on hosts where that directory is
+missing or mounted `noexec` the TUI dies before drawing anything:
+
+```
+Failed to initialize OpenTUI render library: Failed to open library
+"/<tmpdir>/.<hash>-00000001.so": cannot open shared object file
+```
+
+Upstream has this reported repeatedly ([opencode#4605], [opencode#5175],
+[opencode#3765]) and it is a property of the packaging, not of a bad host.
+Compiling in the image lets us keep the library as an ordinary file and hand
+OpenTUI its path, so **nothing is unpacked at runtime**.
+
+[opencode#4605]: https://github.com/anomalyco/opencode/issues/4605
+[opencode#5175]: https://github.com/anomalyco/opencode/issues/5175
+[opencode#3765]: https://github.com/anomalyco/opencode/issues/3765
+
+### How the two stages work
+
+Stage `opencode-build` (debian:13-slim):
+
+1. `git init` + `git fetch --depth 1 origin "$OPENCODE_REF"` + `checkout
+   FETCH_HEAD`. Fetch rather than `clone --branch` so a **bare commit SHA** is a
+   valid ref, not just tags and branches.
+2. Install bun at the version the checked-out tree declares in its
+   `packageManager` field. `packages/script` hard-fails on `^<that version>`,
+   so "whatever bun is current" is not safe.
+3. `bun install --frozen-lockfile`. Needs `build-essential` + `python3`:
+   a couple of tree-sitter grammars build native addons via node-gyp, and
+   without them the install dies half-done with a confusing babel `ENOENT`.
+4. `bun run --cwd packages/opencode script/build.ts --single --skip-install`.
+   - `--single` = host platform only (12 targets otherwise).
+   - `--skip-install` is **required**: without it the build script runs
+     `bun install @opentui/core@catalog:`, and `catalog:` is not a version.
+   - `OPENCODE_CHANNEL=latest` + `OPENCODE_VERSION=…` stamp the version;
+     without them the script queries npm and/or `git branch --show-current` and
+     produces a date-based `0.0.0-…` preview string.
+   - Do **not** set `OPENCODE_RELEASE`: it makes the script `gh release upload`.
+   - Output lands in `packages/opencode/dist/opencode-linux-<arch>/bin/opencode`.
+5. Build the relocatable OpenTUI asset root, then stage 2 copies it and sets
+   `ENV OTUI_ASSET_ROOT=/opt/otui-assets`.
+
+### OTUI_ASSET_ROOT — the actual fix
+
+OpenTUI resolves every runtime asset as `$OTUI_ASSET_ROOT/<package>/<file>`
+*before* falling back to its embedded copy, so pointing it at a real directory
+bypasses the unpack entirely. Verified: with it set, `/proc/<pid>/maps` shows
+`/opt/otui-assets/@opentui/core-linux-x64/libopentui.so` mapped straight from
+disk.
+
+Three things must exist under the root, and OpenTUI **throws if any asset it
+asks for is missing** — which is why whole packages are copied instead of
+hand-picked files:
+
+| Path under the root | Source package |
+|---|---|
+| `@opentui/core-linux-x64/libopentui.so` | `@opentui/core-linux-x64` (its default export *is* the `.so` path) |
+| `@opentui/core/…` (incl. `parser.worker.js`, `assets/`) | `@opentui/core` |
+| `web-tree-sitter/tree-sitter.wasm` | `web-tree-sitter` |
+
+Resolve the paths through `bun -e 'require.resolve(...)'` rather than hardcoding
+`node_modules/.bun/@opentui+core@0.4.5+<hash>/…`, which changes on every bump.
+`@opentui/core-linux-x64` is an optional dep of `@opentui/core`, so it only
+resolves **from inside the core package directory**, not from `packages/opencode`.
+
+Sanity check a change with a negative control — a bogus root must fail loudly:
+
+```bash
+docker run --rm -t -e OTUI_ASSET_ROOT=/nonexistent <image> opencode
+# Missing OpenTUI asset "@opentui/core-linux-x64/libopentui.so" at "/nonexistent/..."
+```
+
+### Pinning the revision
+
+`ARG OPENCODE_REF` in the Dockerfile is the source of truth and is deliberately
+a fixed tag — builds stay reproducible until someone bumps it. Overrides:
+
+- **Local**: `OPENCODE_REF` / `OPENCODE_VERSION` in `.env`, wired through
+  `docker-compose.build.yml`. That file uses the **list form** (`- OPENCODE_REF`)
+  on purpose: an unset variable is then omitted entirely instead of being passed
+  as an empty string, so the Dockerfile pin stays in charge. The mapping form
+  with `${OPENCODE_REF:-}` would silently clobber it with `""`.
+- **CI**: the `opencode_ref` `workflow_dispatch` input. When blank the workflow
+  reads the pin back out of the Dockerfile with `sed`, so the label
+  `org.opencode.ref` always records what was actually built.
+
+`OPENCODE_VERSION` is derived from the ref when empty: `vX.Y.Z` → `X.Y.Z`,
+anything else → `0.0.0-<short sha>`.
+
+### node yes, npm no
+
+Dropping the npm install of opencode does **not** mean node can go too — that
+inference is wrong, and measured:
+
+- **`nodejs` is required.** opencode installs language servers itself with a
+  bundled `@npmcli/arborist` (no npm CLI in the loop), but then spawns them
+  directly from `node_modules/.bin/<name>`, and those are `#!/usr/bin/env node`
+  scripts. Remove node and every JS/TS language server dies at spawn.
+  `packages/opencode/src/lsp/server.ts` → `Npm.which()` → `spawn(bin, …)`.
+- **The `npm` CLI is not.** It costs ~220 MB against nodejs's ~101 MB on
+  debian:13-slim, and the only runtime user is the **ESLint** language server
+  (`lsp/server.ts` runs `npm install` + `npm run compile` on a downloaded
+  vscode-eslint checkout). The other npm-CLI call sites are `opencode upgrade` /
+  `uninstall`, which are meaningless for a binary we compiled ourselves.
+  `APT_PACKAGES="npm"` puts it back per deployment.
+
+### Things that do *not* help
+
+- **Static linking.** OpenTUI reaches its Zig core through `bun:ffi`
+  `dlopen`, which needs a dynamic loader by definition; a fully static binary
+  could not load it at all. Bun's musl targets are still dynamically linked.
+- **Compiling and shipping the binary alone.** `bun build --compile` re-embeds
+  the same `.so`, so the failure comes straight back. The externalised asset
+  root is the part that fixes it, not the compilation.
+- **Running uncompiled** (`bun run packages/opencode/src/index.ts`) does fix it,
+  because the `.so` is then read from `node_modules` — but it drags the
+  monorepo's ~2.7 GB of `node_modules` into the final image (~3.8 GB vs
+  ~1.3 GB). Rejected for that reason.
 
 ## Hard-won gotchas (do not regress these)
 
@@ -88,7 +214,18 @@ bash -n entrypoint.sh init-llama-swap.sh                 # shell syntax
 cp .env.example .env
 docker compose -f docker-compose.nvidia.yml config >/dev/null   # compose valid
 docker compose -f docker-compose.amd.yml   config >/dev/null
+docker compose -f docker-compose.nvidia.yml -f docker-compose.build.yml config \
+    | grep -A3 'args:' || true            # build args resolve as expected
 rm -f .env
+```
+
+The image build itself (no GPU needed) also exercises the whole compile stage,
+because stage 2 runs `opencode --version` and that would fail on a broken asset
+root:
+
+```bash
+docker build -t oc:test .                # ~6 min cold, most of it `bun install`
+docker run --rm -t oc:test --entrypoint bash -c 'opencode --version'
 ```
 
 Full smoke test (needs a GPU host): `up -d --build`, then

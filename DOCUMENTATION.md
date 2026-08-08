@@ -270,6 +270,10 @@ Notes:
   won't come up.
 - This is for *system* packages only. It does not touch npm, pip, or per-user
   config.
+- The image ships `nodejs` but **not** the `npm` CLI (see
+  [the compile-from-source Q&A](#q-why-is-opencode-compiled-from-source-instead-of-installed-from-npm)).
+  If you want it — for your own work, or for the ESLint language server, which
+  is the one part of opencode that shells out to it — set `APT_PACKAGES="npm"`.
 
 ### 2. Run your own setup via the mapped `~/.bashrc`
 
@@ -627,8 +631,12 @@ firewall is set up, precisely so it can amend it:
 
 ```bash
 # /opt/init/init.sh — allow one specific host on the LAN
-iptables -I OUTPUT 4 -d 192.168.1.50 -p tcp --dport 443 -j ACCEPT
+iptables -I OUTPUT 1 -d 192.168.1.50 -p tcp --dport 443 -j ACCEPT
 ```
+
+Position `1` always lands ahead of the reject rules, whatever the entrypoint
+added before it. `init/init.sh.example` ships this and a few variants
+(whole subnet, LAN DNS server) ready to uncomment.
 
 Note DNS keeps working because Docker's resolver lives on `127.0.0.11`
 (loopback). If you point the container at a DNS server on your LAN instead, add
@@ -688,6 +696,55 @@ ports, capabilities — is inherited unchanged from the GPU file. Keeping the
 build in a separate file is why the two GPU files stay identical apart from the
 image tag and the GPU passthrough block.
 
+Expect the build to take a few minutes: opencode is **compiled from source**
+inside the image (see the next question), so the first stage runs a full
+dependency install of the opencode monorepo. None of that reaches the final
+image, which ends up *smaller* than the npm-based one it replaced.
+
+---
+
+## Q: Why is opencode compiled from source instead of installed from npm?
+
+**A:** Because the npm package is not JavaScript. `opencode-ai` ships a ~183 MB
+standalone binary with OpenTUI's native `libopentui.so` **embedded**, and
+starting the TUI makes it unpack that library into a temporary directory before
+loading it. Where that directory is missing, or mounted `noexec` — both common
+in containers and on hardened hosts — opencode dies before drawing anything:
+
+```
+Failed to initialize OpenTUI render library: Failed to open library
+"/<tmpdir>/.<hash>-00000001.so": cannot open shared object file
+```
+
+The `Dockerfile` therefore builds opencode itself in a first stage and keeps the
+native library as an ordinary file, pointed at through `OTUI_ASSET_ROOT`. There
+is no unpacking at runtime, so the failure cannot happen. Two build arguments
+control it, both settable from `.env`:
+
+| Variable | Example | Description |
+|---|---|---|
+| `OPENCODE_REF` | `v1.18.15` | Git revision to compile — tag, branch or commit SHA. Pinned in the `Dockerfile`; builds are reproducible until it is bumped. |
+| `OPENCODE_VERSION` | *(empty)* | Version reported by `opencode --version`. Derived from the ref when empty: `vX.Y.Z` → `X.Y.Z`, otherwise `0.0.0-<short sha>`. |
+
+These are **build**-time only, so they do nothing unless you build the image
+yourself with `docker-compose.build.yml`. To move to a newer opencode:
+
+```bash
+echo 'OPENCODE_REF=v1.19.0' >> .env
+docker compose -f docker-compose.nvidia.yml -f docker-compose.build.yml up -d --build
+```
+
+Leave them unset to get the revision pinned in the `Dockerfile`.
+
+**What this changed about node/npm.** The image still installs `nodejs`, because
+opencode installs its language servers itself and then runs them straight out of
+`node_modules/.bin` — those are `#!/usr/bin/env node` scripts, so without node
+every JS/TS language server fails to start. The `npm` **CLI** is no longer
+installed: it costs ~220 MB (more than twice what nodejs does), opencode uses a
+bundled installer rather than the npm binary, and the only feature that shells
+out to it is the ESLint language server. Set `APT_PACKAGES="npm"` if you want it
+back.
+
 ---
 
 ## Q: How does CI build the image?
@@ -701,3 +758,13 @@ to `main` and `v*` tags. It needs two repository secrets:
 
 It tags `:latest` and `:<short-sha>`, and syncs this repo's README to the Docker
 Hub description.
+
+The opencode revision it compiles comes from the `ARG OPENCODE_REF` line in the
+`Dockerfile`. A manual run (`workflow_dispatch`) can override it with the
+`opencode_ref` input without committing anything; whichever is used ends up on
+the image as the `org.opencode.ref` label:
+
+```bash
+docker buildx imagetools inspect jesusdf/opencode-llama-swap-aio:latest \
+    --format '{{ index .Image.Config.Labels "org.opencode.ref" }}'
+```

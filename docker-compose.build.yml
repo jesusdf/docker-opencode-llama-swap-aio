@@ -8,10 +8,19 @@
 #
 # The image name is kept identical to the published one so the rest of the
 # configuration (and `docker compose down`) behaves the same either way.
+# opencode is compiled from source in the first stage of the Dockerfile, so the
+# revision to build is a build argument, not a runtime variable. It still comes
+# from .env for convenience; leave OPENCODE_REF unset there and the Dockerfile's
+# own pinned default is used.
 services:
   opencode:
     build:
       context: .
       dockerfile: Dockerfile
+      # List form on purpose: an unset variable is left out entirely rather than
+      # passed as an empty string, so the Dockerfile's own pin stays in charge.
+      args:
+        - OPENCODE_REF
+        - OPENCODE_VERSION
     image: jesusdf/opencode-llama-swap-aio:latest
     pull_policy: build

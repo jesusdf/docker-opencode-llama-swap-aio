@@ -30,4 +30,26 @@ set -euo pipefail
 # install -m 644 -o "${PUID:-1000}" -g "${PGID:-1000}" \
 #     /opt/init/gitconfig "${USER_HOME_PATH:-/home/user}/.gitconfig"
 
+# --- Example: punch a hole in the LAN firewall for one specific host ---
+# Only relevant when BLOCK_LOCAL_NETWORK=true. entrypoint.sh installs the reject
+# rules *before* running this hook precisely so it can add exceptions here.
+# Inserting at position 1 always lands ahead of the REJECT rules, so it does not
+# depend on how many ACCEPT rules the entrypoint ended up adding.
+#
+#   # a single host, every port
+#   iptables -I OUTPUT 1 -d 192.168.1.50 -j ACCEPT
+#
+#   # a single host, one port only (tighter — prefer this)
+#   iptables -I OUTPUT 1 -d 192.168.1.50 -p tcp --dport 443 -j ACCEPT
+#
+#   # a whole subnet
+#   iptables -I OUTPUT 1 -d 192.168.1.0/24 -j ACCEPT
+#
+# DNS keeps working without an exception because Docker's resolver lives on
+# 127.0.0.11 (loopback). If you point the container at a DNS server on the LAN
+# instead, it needs its own rule or name resolution breaks:
+#
+#   iptables -I OUTPUT 1 -d 192.168.1.1 -p udp --dport 53 -j ACCEPT
+#   iptables -I OUTPUT 1 -d 192.168.1.1 -p tcp --dport 53 -j ACCEPT
+
 echo "init.sh: nothing to do (edit me)"

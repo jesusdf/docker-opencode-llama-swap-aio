@@ -8,6 +8,11 @@ on:
   schedule:
     - cron: "0 6 * * 1"   # every Monday at 06:00 UTC
   workflow_dispatch:
+    inputs:
+      opencode_ref:
+        description: "opencode git revision to compile (blank = the pin in the Dockerfile)"
+        required: false
+        default: ""
 
 jobs:
   check-base:
@@ -68,6 +73,16 @@ jobs:
       - name: Base image digest
         id: base
         run: echo "digest=$(docker buildx imagetools inspect debian:13-slim --format '{{.Manifest.Digest}}')" >> "$GITHUB_OUTPUT"
+      - name: Resolve opencode revision
+        id: opencode
+        # The Dockerfile ARG is the source of truth; a manual run may override it.
+        run: |
+          ref="${{ github.event.inputs.opencode_ref }}"
+          if [ -z "$ref" ]; then
+            ref=$(sed -n 's/^ARG OPENCODE_REF=\(.*\)$/\1/p' Dockerfile | head -1)
+          fi
+          echo "Compiling opencode from: $ref"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
@@ -75,11 +90,17 @@ jobs:
           file: ./Dockerfile
           platforms: linux/amd64
           push: true
+          # opencode is compiled from source inside the image, so this build is
+          # a good deal slower than a plain apt/npm install — the first stage
+          # runs a full `bun install` of the opencode monorepo.
+          build-args: |
+            OPENCODE_REF=${{ steps.opencode.outputs.ref }}
           tags: |
             docker.io/${{ github.repository_owner }}/opencode-llama-swap-aio:latest
             docker.io/${{ github.repository_owner }}/opencode-llama-swap-aio:${{ steps.vars.outputs.sha_short }}
           labels: |
             org.opencode.base-digest=${{ steps.base.outputs.digest }}
+            org.opencode.ref=${{ steps.opencode.outputs.ref }}
       - name: Update Docker Hub Description
         uses: peter-evans/dockerhub-description@v4
         with:
