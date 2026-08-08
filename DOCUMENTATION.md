@@ -293,13 +293,55 @@ if [ ! -f "$HOME/.setup-done" ]; then
 fi
 ```
 
-Because `user` has passwordless `sudo`, a `.bashrc` script can also install
-system packages (`sudo apt-get install -y ...`) if you prefer to keep everything
-in one place instead of `APT_PACKAGES`.
+Note that `.bashrc` runs as the unprivileged `user`, which has **no sudo** — it
+cannot install system packages or touch anything outside the home directory.
+Root-level work belongs in `APT_PACKAGES` or the `INIT_SCRIPT` hook below.
 
 **Which to use?** `APT_PACKAGES` for declarative system packages that belong in
-`.env` and should exist before login; `~/.bashrc` for per-user tooling, env
-vars, aliases, or richer bootstrap logic. They compose cleanly.
+`.env` and should exist before login; `INIT_SCRIPT` for root-level configuration
+that packages alone cannot express; `~/.bashrc` for per-user tooling, env vars,
+aliases, or richer bootstrap logic. They compose cleanly.
+
+---
+
+## Q: How do I run something as root at boot? (INIT_SCRIPT)
+
+**A:** The image ships **no sudo** and the `user` account has no route to root,
+so root-level customisation is driven from the host instead of from inside the
+container. Mount a directory read-only at `/opt/init` and put an `init.sh` in it:
+
+```yaml
+volumes:
+  - ${INIT_PATH:-./init}:/opt/init:ro
+```
+
+`entrypoint.sh` runs `$INIT_SCRIPT` (default `/opt/init/init.sh`) **as root** on
+every start — after `APT_PACKAGES` is installed and the opencode config is
+generated, before `sshd` starts. If the file does not exist, the step is skipped.
+
+Start from [`init/init.sh.example`](init/init.sh.example):
+
+```bash
+cp init/init.sh.example init/init.sh
+sudo chown -R root:root init && sudo chmod 755 init && sudo chmod 644 init/init.sh
+```
+
+**Why the ownership matters.** A script that runs as root is a privilege
+escalation path if the unprivileged user can edit it — they would just rewrite
+it and wait for a restart. So `entrypoint.sh` checks, as `user`, whether the
+script or its parent directory is writable and **refuses to run it** if so:
+
+```
+ERROR: refusing to run '/opt/init/init.sh': it is writable by 'user'.
+       Mount it read-only (:ro) and owned by root, then restart.
+```
+
+Keep the directory owned by `root`, mounted `:ro`, and **outside**
+`USER_HOME_PATH` (which the user owns by definition).
+
+Two more things to know: the hook runs on **every** start, so make it
+idempotent; and a non-zero exit is logged as a warning but does **not** stop the
+container, so a broken hook can't lock you out of SSH.
 
 ---
 

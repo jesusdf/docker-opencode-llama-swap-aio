@@ -1,0 +1,33 @@
+#!/bin/bash
+# Root-run init hook for the opencode container.
+#
+# Copy this file to init.sh (in the directory mounted at /opt/init) to enable it.
+# entrypoint.sh runs it AS ROOT on every start, after APT_PACKAGES is installed
+# and the opencode config is generated, but before sshd starts.
+#
+# Ownership matters: the container has no sudo, so this script is the only route
+# to root. entrypoint.sh refuses to run it if the unprivileged 'user' account can
+# write to it or to its directory. Mount the directory read-only (:ro) and keep
+# it owned by root on the host:
+#
+#   sudo chown -R root:root ./init && sudo chmod 755 ./init && sudo chmod 644 ./init/init.sh
+#
+# It runs on every start, so keep it idempotent. A non-zero exit is logged as a
+# warning and does not stop the container, so SSH stays reachable if it breaks.
+
+set -euo pipefail
+
+# --- Example: system-wide configuration that APT_PACKAGES cannot express ---
+# printf 'Acquire::http::Proxy "http://proxy.lan:3128";\n' > /etc/apt/apt.conf.d/01proxy
+
+# --- Example: trust an internal CA ---
+# cp /opt/init/corp-ca.crt /usr/local/share/ca-certificates/ && update-ca-certificates
+
+# --- Example: git defaults for every login shell ---
+# git config --system init.defaultBranch main
+
+# --- Example: drop a file into the user's home with the right ownership ---
+# install -m 644 -o "${PUID:-1000}" -g "${PGID:-1000}" \
+#     /opt/init/gitconfig "${USER_HOME_PATH:-/home/user}/.gitconfig"
+
+echo "init.sh: nothing to do (edit me)"

@@ -35,6 +35,9 @@ services:
     env_file: .env
     volumes:
       - ${USER_HOME_PATH}:/home/user
+      # Root-run init hook. Read-only on purpose: the container user has no sudo
+      # and must not be able to modify a script that runs as root.
+      - ${INIT_PATH:-./init}:/opt/init:ro
     ports:
       - "${SSH_PORT:-2222}:22"
     depends_on:

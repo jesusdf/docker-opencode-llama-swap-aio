@@ -53,7 +53,11 @@ It is also possible to enter the container using:
 docker exec -it opencode bash
 ```
 
-You can use sudo to install or modify anything in the container.
+The `user` account is unprivileged and **sudo is not installed** — there is no
+way to become root from an SSH session. To change anything that needs root, use
+`APT_PACKAGES` for packages and the `INIT_SCRIPT` hook for everything else (both
+run as root at boot, from the host-controlled `.env`). If you really need a root
+shell for debugging, go through the host: `docker exec -u 0 -it opencode bash`.
 
 For a full Q&A-style reference (every variable, NVIDIA/AMD requirements,
 troubleshooting) see [`DOCUMENTATION.md`](DOCUMENTATION.md).
@@ -68,9 +72,17 @@ See [`.env.example`](.env.example) for all variables. Highlights:
   (`swap/<MODEL_ID>`) and the opencode model.
 - `CTX_SIZE`, `N_PREDICT`, `KV_CACHE_TYPE`, `MODEL_TTL`, `TEMP`, `TOP_P`,
   `TOP_K` — inference parameters.
+- `REASONING_EFFORT` — reasoning level (`low`, `medium`, `high`) written into the
+  generated opencode model options.
+- `REGENERATE_OPENCODE_CONFIG` — set to `true` to rewrite `opencode.json` on
+  every start (manual edits are lost); `false` generates it only if missing.
 - `LLAMA_API_KEY` — protects the llama-swap API and is used by opencode.
 - `SSH_PUBLIC_KEY` — authorized key for SSH login.
 - `USER_HOME_PATH`, `MODELS_PATH` — host paths for persistence.
+- `INIT_SCRIPT` / `INIT_PATH` — root-run hook. `INIT_PATH` is mounted read-only
+  at `/opt/init`; if `INIT_SCRIPT` (default `/opt/init/init.sh`) exists it is
+  executed as root at boot. Refused if the container user can write to it. See
+  [`init/init.sh.example`](init/init.sh.example).
 - `APT_PACKAGES` — extra Debian packages (space-separated) installed into the
   opencode container at boot. For richer per-user setup you can also edit
   `~/.bashrc` in the mapped home directory — see
