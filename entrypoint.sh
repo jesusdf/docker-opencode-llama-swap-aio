@@ -8,6 +8,7 @@ set -euo pipefail
 : "${N_PREDICT:=8192}"
 : "${REASONING_EFFORT:=high}"
 : "${REASONING_ENABLED:=auto}"
+: "${MMPROJ_ENABLED:=false}"
 : "${REGENERATE_OPENCODE_CONFIG:=false}"
 : "${LLAMA_API_KEY:=}"
 : "${LLAMA_SWAP_URL:=http://llama-swap:8080}"
@@ -109,11 +110,19 @@ if [ ! -f "$OPENCODE_CFG" ] || [ "$REGEN_CFG" = 1 ]; then
         *)              REASONING_MODE=auto ;;
     esac
 
+    # Must mirror MMPROJ_ENABLED on the llama-swap side: llama-server only loads
+    # a projector when that variable is set, so advertising attachments here
+    # while it is off would just produce requests that fail.
+    case "${MMPROJ_ENABLED,,}" in
+        1|true|yes|on) MMPROJ_MODE=true ;;
+        *)             MMPROJ_MODE=false ;;
+    esac
+
     # Every value the generator reads has to be exported: the defaults above are
     # plain shell variables, not part of the environment.
     MODEL_LIST="$MODEL_LIST" DEFAULT_MODEL="swap/${MODEL_ID}" \
     CTX_SIZE="$CTX_SIZE" N_PREDICT="$N_PREDICT" REASONING_EFFORT="$REASONING_EFFORT" \
-    REASONING_MODE="$REASONING_MODE" \
+    REASONING_MODE="$REASONING_MODE" MMPROJ_MODE="$MMPROJ_MODE" \
     LLAMA_SWAP_URL="$LLAMA_SWAP_URL" LLAMA_API_KEY="$LLAMA_API_KEY" \
     python3 > "$OPENCODE_CFG" <<'PY'
 import json, os
@@ -150,20 +159,26 @@ else:
     # config is ever pointed at a provider that does honour it.
     model_options = {"reasoningEffort": effort, "chat_template_kwargs": kwargs}
 
-# Attachments are advertised for every model, unconditionally.
+# Attachment support follows MMPROJ_ENABLED, and applies to every model.
 #
-# opencode treats a custom-provider model as text-only unless it declares these,
-# and this container cannot tell which models are multimodal anyway: it never
-# sees /models, only the list of ids from llama-swap. Declaring them everywhere
-# means the option is always offered; if the model has no projector, the request
-# simply fails at llama-server, which is a clearer outcome than the attachment
-# button never appearing.
+# opencode treats a custom-provider model as text-only unless it declares these
+# fields, and this container cannot tell which models are multimodal anyway: it
+# never sees /models, only the list of ids from llama-swap. So the switch is
+# all-or-nothing, and it tracks the one thing we do know — whether llama-server
+# was told to load a projector at all. With it off, an attachment could only
+# ever fail, so the option is not offered; with it on it is offered for every
+# model, and a model that has no projector fails at llama-server, which is a
+# clearer outcome than the attachment button never appearing.
 #
 # `image` and `audio` are the two llama.cpp actually handles (both through the
 # same mmproj); video and pdf are deliberately left out.
+multimodal = os.environ["MMPROJ_MODE"] == "true"
 capabilities = {
-    "attachment": True,
-    "modalities": {"input": ["text", "image", "audio"], "output": ["text"]},
+    "attachment": multimodal,
+    "modalities": {
+        "input": ["text", "image", "audio"] if multimodal else ["text"],
+        "output": ["text"],
+    },
     # The documented capability field is `tool_call`; `tools` is not part of the
     # model schema and was being ignored.
     "tool_call": True,

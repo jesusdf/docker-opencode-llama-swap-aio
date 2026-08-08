@@ -38,8 +38,10 @@ parameters and SSH key are all driven by environment variables.
 | Variable | Example | Description |
 |---|---|---|
 | `MODEL_REPO` | `unsloth/gemma-4-12b-it-GGUF` | Hugging Face repo to download the GGUF from. **Required.** |
-| `MODEL_QUANT` | `UD-Q4_K_XL` | Quant pattern to match when downloading (`*<MODEL_QUANT>*.gguf`). Split shards and `mmproj*` (vision) files are picked up automatically. |
+| `MODEL_QUANT` | `UD-Q4_K_XL` | Quant pattern to match when downloading (`*<MODEL_QUANT>*.gguf`). Split shards are picked up automatically. |
 | `MODEL_ID` | `gemma4-12b` | Internal name used for the llama-swap model (`swap/<MODEL_ID>`) and the opencode model. |
+| `MMPROJ_ENABLED` | `false` | Accept images/audio by loading the multimodal projector. **Off by default** because a loaded projector disables llama.cpp's prompt cache reuse, which costs far more in a text-only coding session than vision is worth. See [the vision Q&A](#q-does-vision--multimodal-work). |
+| `MMPROJ_QUANT` | `F16` | Which projector to download when the repo ships several (`BF16`/`F16`/`F32`). Empty downloads them all. Only used when `MMPROJ_ENABLED=true`. |
 | `HF_TOKEN` | *(empty)* | Hugging Face token; only needed for gated/private repos. |
 | `CTX_SIZE` | `262144` | Context window (`--ctx-size`). |
 | `N_PREDICT` | `8192` | Max tokens to generate (`--n-predict`). |
@@ -355,7 +357,7 @@ GGUF becomes a model, named after the directory:
   gemma4-12b/    gemma-4-12b-it-UD-Q4_K_XL.gguf        -> swap/gemma4-12b
   qwen-coder/    qwen-coder-Q8_0.gguf                  -> swap/qwen-coder
   big-70b/       big-70b-…-00001-of-00003.gguf         -> swap/big-70b
-                 mmproj-F16.gguf                          (vision, auto-attached)
+                 mmproj-F16.gguf                          (vision, only if MMPROJ_ENABLED)
 ```
 
 `MODEL_REPO`/`MODEL_QUANT`/`MODEL_ID` only decide what gets **downloaded** on
@@ -364,7 +366,8 @@ model, download it into its own directory and restart llama-swap.
 
 Per directory the entrypoint prefers the first shard of a split GGUF, prefers
 `MODEL_QUANT` when several quants coexist, and ignores `mmproj*` when choosing
-the model file (it is the vision projector, attached via `--mmproj` instead).
+the model file (it is the vision projector, attached via `--mmproj` instead —
+and only when `MMPROJ_ENABLED=true`, which it is not by default).
 
 All models go into one `exclusive` swap group, since a single GPU can only hold
 one at a time — llama-swap unloads the current one before starting another.
@@ -406,6 +409,7 @@ This is also exactly the default configuration:
 MODEL_REPO=unsloth/gemma-4-12b-it-GGUF
 MODEL_QUANT=UD-Q4_K_XL
 MODEL_ID=gemma4-12b
+MMPROJ_ENABLED=false    # no vision: keeps prompt cache reuse (and VRAM) free
 
 CTX_SIZE=32768          # the single biggest VRAM lever
 KV_CACHE_TYPE=q8_0
@@ -426,6 +430,7 @@ in RAM:
 MODEL_REPO=unsloth/Qwen3.6-35B-A3B-GGUF
 MODEL_QUANT=UD-Q3_K_XL
 MODEL_ID=qwen36-35b-a3b
+MMPROJ_ENABLED=false    # skip the projector: VRAM is already tight here
 
 CTX_SIZE=32768
 KV_CACHE_TYPE=q8_0
@@ -450,14 +455,32 @@ Qwen's experts go to RAM. `N_GPU_LAYERS` and `CTX_SIZE`, by contrast, hit both.
 
 ## Q: Does vision / multimodal work?
 
-**A:** On the llama-swap side, yes, and automatically. If a model directory
-contains an `mmproj*.gguf` next to the GGUF, `init-llama-swap.sh` attaches it
-with `--mmproj` and llama-server serves images through the OpenAI-compatible
-API. Verified end to end: an image posted to `/v1/chat/completions` as an
-`image_url` content part is described correctly.
+**A:** Yes, but it is **off by default** — set `MMPROJ_ENABLED=true`.
 
-The projector is downloaded along with the model, so for a multimodal repo like
-`unsloth/gemma-4-12b-it-GGUF` you get it without doing anything.
+With it on, `init-llama-swap.sh` downloads the projector alongside the weights,
+attaches it to every model directory that has one with `--mmproj`, and
+llama-server serves images through the OpenAI-compatible API. Verified end to
+end: an image posted to `/v1/chat/completions` as an `image_url` content part is
+described correctly. With it off, the projector is neither downloaded nor
+passed, and a projector already sitting in the directory is ignored.
+
+### Why it defaults to off: `MMPROJ_ENABLED`
+
+Because loading a projector makes llama.cpp **turn off prompt cache reuse**
+(`--cache-reuse`). The command line still carries the flag, but it has no effect
+while an mmproj is loaded, so every request reprocesses the entire prompt
+instead of resuming from the common prefix.
+
+In an opencode session that is the wrong trade. The prompt is long (system
+prompt + tool definitions + accumulated conversation), it grows turn by turn,
+and each turn shares almost all of its prefix with the previous one — exactly
+the case cache reuse exists for. Paying full prompt processing on every turn to
+keep a capability that a coding session almost never uses is a bad deal, so you
+have to ask for it.
+
+Switching it on later is safe: the projector download is tracked separately from
+the weights, so a model that is already on disk gets its projector fetched on
+the next start rather than being skipped as "already present".
 
 ### Choosing the projector: `MMPROJ_QUANT`
 
@@ -486,7 +509,8 @@ available one is used and the reason is logged:
 That fallback is deliberate: a model downloaded before this variable existed
 keeps its vision instead of silently losing it.
 
-On the opencode side, the generated `opencode.json` declares every model as
+On the opencode side, `MMPROJ_ENABLED` decides what the generated
+`opencode.json` advertises. With it on, every model is declared
 attachment-capable:
 
 ```json
@@ -494,16 +518,24 @@ attachment-capable:
 "modalities": { "input": ["text", "image", "audio"], "output": ["text"] }
 ```
 
-This is unconditional and deliberate. The opencode container never sees
-`/models` — it only learns model *ids* from llama-swap's `/v1/models` — so it
-cannot tell which models have a projector. Advertising the capability
-everywhere means the attachment option is always available; against a model with
-no projector the request just fails at llama-server, which is a more useful
-outcome than the option silently never appearing. `video` and `pdf` are left
-out because llama.cpp does not handle them.
+With it off, `"attachment": false` and the input modality list is `["text"]`.
 
-Without these fields opencode treats a custom-provider model as text-only, which
-is why they matter — the capability is off by default.
+It is all-or-nothing rather than per model, and deliberately so: the opencode
+container never sees `/models` — it only learns model *ids* from llama-swap's
+`/v1/models` — so it cannot tell which models have a projector. The one thing it
+does know is whether llama-server was told to load one at all, which is what it
+keys off. With the flag on, the attachment option is offered everywhere; against
+a model with no projector the request just fails at llama-server, which is a
+more useful outcome than the option silently never appearing. `video` and `pdf`
+are left out because llama.cpp does not handle them.
+
+Without these fields opencode treats a custom-provider model as text-only — that
+is opencode's own default for a custom provider, which is why they have to be
+written out explicitly when multimodal input is wanted.
+
+Remember that `opencode.json` is generated once. After flipping
+`MMPROJ_ENABLED`, either delete it or set `REGENERATE_OPENCODE_CONFIG=true` so
+the capabilities are rewritten.
 
 **Caveat worth knowing:** `opencode run` (the non-interactive CLI) does **not**
 expand `@file` mentions into attachments — the path is sent as literal text, so

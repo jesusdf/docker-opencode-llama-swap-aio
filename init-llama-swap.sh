@@ -7,6 +7,12 @@ shopt -s nullglob
 # ----------------------------------------------------------------------------
 : "${MODEL_REPO:?MODEL_REPO is required, e.g. unsloth/gemma-4-12b-it-GGUF}"
 : "${MODEL_QUANT:=UD-Q4_K_XL}"
+# Load the multimodal projector (vision/audio input). Off by default: llama.cpp
+# turns off prompt cache reuse whenever an mmproj is attached, so every request
+# reprocesses the whole prompt — a heavy price for a capability most coding
+# sessions never use. When false the projector is neither downloaded nor passed
+# to llama-server.
+: "${MMPROJ_ENABLED:=false}"
 # Which multimodal projector to fetch when the repo ships several (unsloth
 # publishes BF16/F16/F32). Empty means "any", i.e. download them all — hence
 # '=' and not ':=', which would treat an explicitly empty value as unset.
@@ -35,6 +41,11 @@ shopt -s nullglob
 # Reasoning: 'auto' lets the chat template decide (llama-server's own default).
 : "${REASONING_ENABLED:=auto}"
 
+case "${MMPROJ_ENABLED,,}" in
+    1|true|yes|on) USE_MMPROJ=1 ;;
+    *)             USE_MMPROJ=0 ;;
+esac
+
 MODELS_DIR="/models"
 MODEL_DIR="${MODELS_DIR}/${MODEL_ID}"
 CONFIG_FILE="${MODELS_DIR}/config.yaml"
@@ -44,9 +55,23 @@ CONFIG_FILE="${MODELS_DIR}/config.yaml"
 # ----------------------------------------------------------------------------
 mkdir -p "$MODEL_DIR"
 
+# The weights and the projector are tracked separately so that turning
+# MMPROJ_ENABLED on later still fetches the projector for a model that is
+# already downloaded — otherwise the "model present, skip" shortcut would leave
+# vision permanently unavailable.
 existing=("$MODEL_DIR"/*"${MODEL_QUANT}"*.gguf)
-if [ ${#existing[@]} -eq 0 ]; then
-    echo ">> Model '${MODEL_REPO}' (${MODEL_QUANT}) not found in ${MODEL_DIR}, downloading..."
+existing_mmproj=("$MODEL_DIR"/*[mM][mM][pP][rR][oO][jJ]*.gguf)
+
+NEED_MODEL=0
+NEED_MMPROJ=0
+[ ${#existing[@]} -eq 0 ] && NEED_MODEL=1
+[ "$USE_MMPROJ" = 1 ] && [ ${#existing_mmproj[@]} -eq 0 ] && NEED_MMPROJ=1
+
+if [ "$NEED_MODEL" = 1 ] || [ "$NEED_MMPROJ" = 1 ]; then
+    [ "$NEED_MODEL" = 1 ] \
+        && echo ">> Model '${MODEL_REPO}' (${MODEL_QUANT}) not found in ${MODEL_DIR}, downloading..."
+    [ "$NEED_MMPROJ" = 1 ] \
+        && echo ">> Projector (mmproj) not found in ${MODEL_DIR}, downloading..."
 
     if ! command -v huggingface-cli >/dev/null 2>&1; then
         apt-get update
@@ -65,22 +90,25 @@ if [ ${#existing[@]} -eq 0 ]; then
     # fnmatch has no word boundaries, so a bare '*F16*' matches 'mmproj-BF16'
     # and we would keep downloading the extra projector this variable exists to
     # avoid. Every real-world name puts a separator there.
-    MMPROJ_INCLUDES=()
-    if [ -n "$MMPROJ_QUANT" ]; then
-        for variant in "$MMPROJ_QUANT" "${MMPROJ_QUANT,,}" "${MMPROJ_QUANT^^}"; do
-            case " ${MMPROJ_INCLUDES[*]} " in
-                *"[-_.]${variant}*.gguf "*) continue ;;
-            esac
-            MMPROJ_INCLUDES+=(--include "*mmproj*[-_.]${variant}*.gguf")
-        done
-    else
-        MMPROJ_INCLUDES=(--include "*mmproj*.gguf")
+    DOWNLOAD_INCLUDES=()
+    [ "$NEED_MODEL" = 1 ] && DOWNLOAD_INCLUDES+=(--include "*${MODEL_QUANT}*.gguf")
+
+    if [ "$NEED_MMPROJ" = 1 ]; then
+        if [ -n "$MMPROJ_QUANT" ]; then
+            for variant in "$MMPROJ_QUANT" "${MMPROJ_QUANT,,}" "${MMPROJ_QUANT^^}"; do
+                case " ${DOWNLOAD_INCLUDES[*]} " in
+                    *"[-_.]${variant}*.gguf "*) continue ;;
+                esac
+                DOWNLOAD_INCLUDES+=(--include "*mmproj*[-_.]${variant}*.gguf")
+            done
+        else
+            DOWNLOAD_INCLUDES+=(--include "*mmproj*.gguf")
+        fi
     fi
 
     export HF_XET_HIGH_PERFORMANCE=1
     hf download "$MODEL_REPO" \
-        --include "*${MODEL_QUANT}*.gguf" \
-        "${MMPROJ_INCLUDES[@]}" \
+        "${DOWNLOAD_INCLUDES[@]}" \
         --local-dir "$MODEL_DIR" \
         ${HF_TOKEN:+--token "$HF_TOKEN"}
 else
@@ -165,7 +193,10 @@ for dir in "$MODELS_DIR"/*/; do
         continue
     fi
 
-    mmproj_file="$(resolve_mmproj "$dir")"
+    # Only look for a projector when it is going to be used; a stale one left in
+    # the directory must not silently re-enable vision (and kill cache reuse).
+    mmproj_file=""
+    [ "$USE_MMPROJ" = 1 ] && mmproj_file="$(resolve_mmproj "$dir")"
 
     MODEL_IDS+=("$id")
     MODEL_FILES+=("$file")
@@ -179,6 +210,11 @@ if [ ${#MODEL_IDS[@]} -eq 0 ]; then
     exit 1
 fi
 echo ">> Serving ${#MODEL_IDS[@]} model(s)."
+if [ "$USE_MMPROJ" = 1 ]; then
+    echo ">> Multimodal input enabled — note that --cache-reuse is inert while an mmproj is loaded."
+else
+    echo ">> Multimodal input disabled (MMPROJ_ENABLED=false); prompt cache reuse stays effective."
+fi
 
 # ----------------------------------------------------------------------------
 # Optional llama-server flags, shared by every model.

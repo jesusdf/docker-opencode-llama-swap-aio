@@ -74,9 +74,13 @@ troubleshooting) see [`DOCUMENTATION.md`](DOCUMENTATION.md).
 See [`.env.example`](.env.example) for all variables. Highlights:
 
 - `MODEL_REPO` / `MODEL_QUANT` — Hugging Face GGUF repo and quant pattern to
-  download (multimodal `mmproj*` files are picked up automatically).
+  download.
+- `MMPROJ_ENABLED` — multimodal (image/audio) input, **off by default**: loading
+  the projector disables llama.cpp's prompt cache reuse, which costs far more in
+  a text-only coding session than vision is worth. Set `true` to enable it on
+  both llama-server (`--mmproj`) and opencode (attachment capability).
 - `MMPROJ_QUANT` — which multimodal projector to fetch when a repo ships several
-  (default `F16`); empty downloads them all.
+  (default `F16`); empty downloads them all. Only used when `MMPROJ_ENABLED`.
 - `MODEL_ID` — name of the model directory under `MODELS_PATH`, and the default
   model in opencode. It only controls what gets *downloaded*: llama-swap serves
   every model directory it finds, and opencode is configured with all of them.
