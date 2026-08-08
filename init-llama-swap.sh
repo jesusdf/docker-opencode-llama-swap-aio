@@ -42,7 +42,8 @@ if [ ${#existing[@]} -eq 0 ]; then
 
     export HF_XET_HIGH_PERFORMANCE=1
     hf download "$MODEL_REPO" \
-        --include "*${MODEL_QUANT}*.gguf" "mmproj*.gguf" \
+        --include "*${MODEL_QUANT}*.gguf" \
+        --include "mmproj*.gguf" \
         --local-dir "$MODEL_DIR" \
         ${HF_TOKEN:+--token "$HF_TOKEN"}
 else
