@@ -8,6 +8,9 @@ set -euo pipefail
 : "${N_PREDICT:=8192}"
 : "${REASONING_EFFORT:=high}"
 : "${REASONING_ENABLED:=auto}"
+# Must match the default in init-llama-swap.sh: the two sides of the reasoning
+# config have to agree.
+: "${PRESERVE_REASONING:=true}"
 : "${MMPROJ_ENABLED:=false}"
 : "${REGENERATE_OPENCODE_CONFIG:=false}"
 : "${LLAMA_API_KEY:=}"
@@ -120,9 +123,18 @@ if [ ! -f "$OPENCODE_CFG" ] || [ "$REGEN_CFG" = 1 ]; then
 
     # Every value the generator reads has to be exported: the defaults above are
     # plain shell variables, not part of the environment.
+    # Preserved reasoning is requested on both sides on purpose — see the note
+    # in the generator below for why the server flag alone is not enough.
+    case "${PRESERVE_REASONING,,}" in
+        1|true|yes|on)  PRESERVE_MODE=true ;;
+        0|false|no|off) PRESERVE_MODE=false ;;
+        *)              PRESERVE_MODE=auto ;;
+    esac
+
     MODEL_LIST="$MODEL_LIST" DEFAULT_MODEL="swap/${MODEL_ID}" \
     CTX_SIZE="$CTX_SIZE" N_PREDICT="$N_PREDICT" REASONING_EFFORT="$REASONING_EFFORT" \
     REASONING_MODE="$REASONING_MODE" MMPROJ_MODE="$MMPROJ_MODE" \
+    PRESERVE_MODE="$PRESERVE_MODE" \
     LLAMA_SWAP_URL="$LLAMA_SWAP_URL" LLAMA_API_KEY="$LLAMA_API_KEY" \
     python3 > "$OPENCODE_CFG" <<'PY'
 import json, os
@@ -155,6 +167,23 @@ else:
     kwargs = {"reasoning_effort": effort}
     if mode == "true":
         kwargs["enable_thinking"] = True
+
+    # Preserved reasoning, belt and braces.
+    #
+    # llama-server has `--reasoning-preserve`, which init-llama-swap.sh passes,
+    # but it only applies to templates llama.cpp recognises as having the
+    # `supports_preserve_reasoning` capability — a detection keyed to a specific
+    # variable name. Qwen3.6's template gates the same behaviour on its own
+    # `preserve_thinking`, so sending the kwarg too covers the case where the
+    # server-side detection does not fire. Whichever route applies, the effect
+    # is identical, and a template that reads neither ignores both.
+    #
+    # Only meaningful if the client actually sends prior reasoning back in the
+    # history; when it does not, this is inert rather than harmful.
+    preserve = os.environ["PRESERVE_MODE"]
+    if preserve != "auto":
+        kwargs["preserve_thinking"] = preserve == "true"
+
     # `reasoningEffort` is kept as well: harmless here, and correct if this
     # config is ever pointed at a provider that does honour it.
     model_options = {"reasoningEffort": effort, "chat_template_kwargs": kwargs}
@@ -216,6 +245,32 @@ print(json.dumps({
 }, indent=2))
 PY
     chown "$PUID:$PGID" "$OPENCODE_CFG"
+else
+    # Kept config: check it still points at a model llama-swap actually serves.
+    # This is the failure people hit after changing MODEL_ID (or after pulling a
+    # release that changed the default), because opencode.json is written once
+    # and then left alone — so it silently keeps naming a model that is gone,
+    # and every request 404s with nothing obvious in the logs.
+    AUTH=()
+    [ -n "$LLAMA_API_KEY" ] && AUTH=(-H "Authorization: Bearer ${LLAMA_API_KEY}")
+    if MODELS_JSON="$(curl -fsS --max-time 10 "${AUTH[@]}" "${LLAMA_SWAP_URL}/v1/models" 2>/dev/null)"; then
+        CFG_MODEL="$(python3 -c \
+            'import json,sys; print(json.load(open(sys.argv[1])).get("model",""))' \
+            "$OPENCODE_CFG" 2>/dev/null || true)"
+        SERVED="$(printf '%s' "$MODELS_JSON" | python3 -c \
+            'import json,sys; print("\n".join("llamaswap/"+m["id"] for m in json.load(sys.stdin).get("data",[]) if m.get("id")))' \
+            2>/dev/null || true)"
+        if [ -n "$CFG_MODEL" ] && [ -n "$SERVED" ] \
+           && ! printf '%s\n' "$SERVED" | grep -qxF "$CFG_MODEL"; then
+            echo "WARNING: $OPENCODE_CFG selects '$CFG_MODEL', which llama-swap is not serving." >&2
+            echo "         Served right now:" >&2
+            printf '           %s\n' $SERVED >&2
+            echo "         The config is only written once, so a changed MODEL_ID leaves it stale." >&2
+            echo "         Fix it by editing the file, or set REGENERATE_OPENCODE_CONFIG=true to" >&2
+            echo "         rewrite it from .env (this discards any manual edits, MCP servers" >&2
+            echo "         included)." >&2
+        fi
+    fi
 fi
 
 # --- Egress firewall (optional) ---

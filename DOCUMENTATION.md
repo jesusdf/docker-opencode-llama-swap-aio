@@ -37,18 +37,21 @@ parameters and SSH key are all driven by environment variables.
 
 | Variable | Example | Description |
 |---|---|---|
-| `MODEL_REPO` | `unsloth/gemma-4-12b-it-GGUF` | Hugging Face repo to download the GGUF from. **Required.** |
-| `MODEL_QUANT` | `UD-Q4_K_XL` | Quant pattern to match when downloading (`*<MODEL_QUANT>*.gguf`). Split shards are picked up automatically. |
-| `MODEL_ID` | `gemma4-12b` | Internal name used for the llama-swap model (`swap/<MODEL_ID>`) and the opencode model. |
-| `MMPROJ_ENABLED` | `false` | Accept images/audio by loading the multimodal projector. **Off by default** because a loaded projector disables llama.cpp's prompt cache reuse, which costs far more in a text-only coding session than vision is worth. See [the vision Q&A](#q-does-vision--multimodal-work). |
+| `MODEL_REPO` | `unsloth/Qwen3.6-35B-A3B-MTP-GGUF` | Hugging Face repo to download the GGUF from. **Required.** The default is an MTP build; see [the MTP Q&A](#q-what-is-mtp-and-what-does-it-cost-me). |
+| `MODEL_QUANT` | `UD-IQ3_S` | Quant pattern to match when downloading (`*<MODEL_QUANT>*.gguf`). Split shards are picked up automatically. |
+| `MODEL_ID` | `qwen3.6-35b-a3b-mtp` | Internal name used for the llama-swap model (`swap/<MODEL_ID>`) and the opencode model. |
+| `MMPROJ_ENABLED` | `false` | Accept images/audio by loading the multimodal projector. **Off by default** because a loaded projector disables llama.cpp's prompt cache reuse, and because it is incompatible with MTP. See [the vision Q&A](#q-does-vision--multimodal-work). |
+| `MTP_ENABLED` | `true` | Multi-token prediction: the model drafts ahead with heads baked into its own weights. ~1.5-2x faster generation. Incompatible with `MMPROJ_ENABLED=true` and with `N_PARALLEL != 1`; either one makes the entrypoint warn and disable MTP. |
+| `SPEC_DRAFT_N_MAX` | `2` | Tokens drafted per step when MTP is on (`--spec-draft-n-max`). llama.cpp's own default is 3. |
 | `MMPROJ_QUANT` | `F16` | Which projector to download when the repo ships several (`BF16`/`F16`/`F32`). Empty downloads them all. Only used when `MMPROJ_ENABLED=true`. |
 | `HF_TOKEN` | *(empty)* | Hugging Face token; only needed for gated/private repos. |
 | `CTX_SIZE` | `262144` | Context window (`--ctx-size`). |
 | `N_PREDICT` | `8192` | Max tokens to generate (`--n-predict`). |
-| `N_PARALLEL` | `1` | Concurrent request slots (`--parallel`). `1` suits a single opencode session. `CTX_SIZE` is the **total** KV budget shared by the slots, so raise both together or each request gets less context — and check the larger KV cache still fits in VRAM. |
+| `N_PARALLEL` | `1` | Concurrent request slots (`--parallel`). `1` suits a single opencode session, and is also required by MTP. `CTX_SIZE` is the **total** KV budget shared by the slots, so raise both together or each request gets less context — and check the larger KV cache still fits in VRAM. |
+| `PRESERVE_REASONING` | `true` | Keep every assistant turn's reasoning in the prompt, not just the newest. Helps the agent loop and keeps the prompt append-only so `--cache-reuse` survives; costs context. `auto` leaves the template's default alone. See [the reasoning Q&A](#q-how-do-i-control-whether-the-model-thinks-reasoning_enabled). |
 | `KV_CACHE_TYPE` | `q8_0` | KV cache quantization (`-ctk`/`-ctv`). |
 | `MODEL_TTL` | `900` | Seconds llama-swap keeps the model loaded while idle. |
-| `TEMP` / `TOP_P` / `TOP_K` | `0.7` / `0.95` / `64` | Sampling parameters. |
+| `TEMP` / `TOP_P` / `TOP_K` | `0.6` / `0.95` / `20` | Sampling parameters. The defaults are Qwen's recommendation for Qwen3.6 in **thinking + coding** mode (its general-use numbers differ). Not universal — revisit them if you change model family. |
 | `LLAMA_API_KEY` | `your_api_key_here` | Protects the llama-swap API and is used by opencode. Leave empty to disable auth. |
 
 ### User / runtime
@@ -483,6 +486,28 @@ the case cache reuse exists for. Paying full prompt processing on every turn to
 keep a capability that a coding session almost never uses is a bad deal, so you
 have to ask for it.
 
+### The second reason: mmproj and MTP cannot coexist
+
+llama.cpp will not run **speculative decoding** with a projector loaded — it
+refuses with *"speculative decoding is not supported with multimodal"*. MTP is
+speculative decoding, so `MMPROJ_ENABLED=true` and `MTP_ENABLED=true` are
+mutually exclusive.
+
+Rather than let llama-server fail to start, `init-llama-swap.sh` resolves it:
+both settings are off/1 by default, so if you turned the projector on you did it
+deliberately, and that is what survives. MTP is disabled and the reason is
+printed in the log:
+
+```
+>> WARNING: MTP_ENABLED and MMPROJ_ENABLED are incompatible — llama.cpp cannot
+>>          run speculative decoding with a projector loaded. Keeping the
+>>          multimodal projector you asked for and disabling MTP.
+>>          Set MMPROJ_ENABLED=false to get the MTP speedup back.
+```
+
+So turning on vision costs you twice over: prompt cache reuse *and* roughly
+1.5-2x of generation speed. Worth knowing before you flip it.
+
 Switching it on later is safe: the projector download is tracked separately from
 the weights, so a model that is already on disk gets its projector fetched on
 the next start rather than being skipped as "already present".
@@ -594,11 +619,105 @@ and like this for `false` (no point advertising an effort level you're disabling
 
 Remember `opencode.json` is only regenerated when missing or when
 `REGENERATE_OPENCODE_CONFIG=true` — set that after changing either variable.
+When it is kept, the entrypoint at least checks that the model it names is one
+llama-swap is actually serving, and warns if not:
+
+```
+WARNING: /home/user/.config/opencode/opencode.json selects 'llamaswap/swap/gemma4-12b',
+         which llama-swap is not serving.
+         Served right now:
+           llamaswap/swap/qwen3.6-35b-a3b-mtp
+```
+
+That is the failure you get after changing `MODEL_ID` — or after pulling a
+release that changed the default — because the file is written once and then
+left alone. Without the warning it just 404s on every request.
+
+### Keeping the whole reasoning trace: `PRESERVE_REASONING`
+
+By default a chat template renders the `<think>` block of only the **most
+recent** assistant turn; older turns get their reasoning stripped. `PRESERVE_REASONING=true`
+(the default here) keeps all of it.
+
+Two reasons it is worth having:
+
+- **The agent loop reads better.** The model can see how it reasoned through
+  earlier tool calls instead of only seeing the calls themselves.
+- **The prompt becomes append-only**, which matters more than it sounds. Without
+  it, each new user turn *removes* the previous turn's thinking from the
+  rendered history. That changes the prefix mid-conversation, and everything
+  `--cache-reuse` had cached from that point on is thrown away. With it, the
+  history only ever grows at the end and the cache survives.
+
+The cost is context: traces accumulate, so a long session reaches `CTX_SIZE`
+sooner. Set it to `false` if you would rather have the room.
+
+It is applied on **both** sides on purpose. llama-server has a first-class flag,
+`--reasoning-preserve`, which is what `init-llama-swap.sh` passes; but that flag
+only takes effect for templates llama.cpp recognises as having the
+`supports_preserve_reasoning` capability, and that detection keys on a specific
+variable name. Qwen3.6's template gates the same behaviour on its own
+`preserve_thinking`, so opencode sends that as a `chat_template_kwargs` entry
+too. Whichever route applies, the result is the same; a template that reads
+neither ignores both.
+
+One caveat worth stating plainly: this can only help if the client actually
+sends prior reasoning back in the request history. Where it does not, both the
+flag and the kwarg are inert rather than harmful.
 
 Related server-side flags, reachable through `EXTRA_LLAMA_ARGS`:
 `--reasoning-budget N` (cap thinking tokens) and `--reasoning-format`
 (`deepseek` puts thoughts in `message.reasoning_content`, `none` leaves them
 inline in the content).
+
+---
+
+## Q: What is MTP, and what does it cost me?
+
+**A:** Multi-token prediction. The model carries extra prediction heads in its
+own weights, drafts the next few tokens with them, and verifies the drafts
+against the main head in a single pass — speculative decoding with **no separate
+draft model**. unsloth reports ~1.5-2x faster generation with no accuracy loss.
+It landed in llama.cpp in May 2026 ([PR #22673](https://github.com/ggml-org/llama.cpp/pull/22673)).
+
+It is **on by default** here, which is why `MODEL_REPO` defaults to an
+`-MTP-GGUF` build: the heads ship inside the weights, so a plain `-GGUF` repo
+has nothing to draft with. The generated `cmd:` gets:
+
+```
+--spec-type draft-mtp --spec-draft-n-max 2
+```
+
+`SPEC_DRAFT_N_MAX` is how many tokens are drafted per step. llama.cpp's own
+default is 3 and unsloth recommends 2; more pays off when the acceptance rate is
+high and costs when it is not, so measure both on your GPU.
+
+### What turns it off
+
+Two settings are incompatible with MTP. Rather than let llama-server fail to
+start, `init-llama-swap.sh` detects each one, prints why, and disables MTP —
+both conflicting settings are off/1 by default, so hitting one means you asked
+for it deliberately, and the deliberate choice wins:
+
+| Setting | Why | What happens |
+|---|---|---|
+| `MMPROJ_ENABLED=true` | llama.cpp will not run speculative decoding with a projector loaded | MTP off, vision kept |
+| `N_PARALLEL != 1` | upstream only implements a single slot for MTP so far | MTP off, slots kept |
+
+There is also a name check: if `MTP_ENABLED=true` but `MODEL_REPO` does not look
+like an MTP build, you get a warning and the run continues, because the name is
+a heuristic and only the GGUF metadata is authoritative.
+
+### Requirements
+
+Your llama-swap image needs a llama.cpp new enough to have `--spec-type`.
+`ghcr.io/mostlygeek/llama-swap:cuda` does — verified on build 10326, which lists
+`draft-mtp` among the accepted `--spec-type` values. Check yours with:
+
+```bash
+docker run --rm --entrypoint /app/llama-server \
+    ghcr.io/mostlygeek/llama-swap:cuda --help | grep -- --spec-type
+```
 
 ---
 

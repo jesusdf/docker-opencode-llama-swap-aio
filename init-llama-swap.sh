@@ -5,7 +5,7 @@ shopt -s nullglob
 # ----------------------------------------------------------------------------
 # Defaults (overridable via environment / .env)
 # ----------------------------------------------------------------------------
-: "${MODEL_REPO:?MODEL_REPO is required, e.g. unsloth/gemma-4-12b-it-GGUF}"
+: "${MODEL_REPO:?MODEL_REPO is required, e.g. unsloth/Qwen3.6-35B-A3B-MTP-GGUF}"
 : "${MODEL_QUANT:=UD-Q4_K_XL}"
 # Load the multimodal projector (vision/audio input). Off by default: llama.cpp
 # turns off prompt cache reuse whenever an mmproj is attached, so every request
@@ -46,10 +46,72 @@ shopt -s nullglob
 # Reasoning: 'auto' lets the chat template decide (llama-server's own default).
 : "${REASONING_ENABLED:=auto}"
 
+# Keep the whole reasoning trace in the rendered history instead of only the
+# last assistant turn. 'auto' leaves the template's own default alone.
+: "${PRESERVE_REASONING:=true}"
+
+# Multi-token prediction. The model drafts the next few tokens with its own
+# built-in MTP heads and verifies them in one pass — speculative decoding with
+# no separate draft model. Requires a GGUF that ships the heads (the "-MTP-"
+# repos) and a llama.cpp new enough to have `--spec-type` (merged 2026-05).
+# Whether MTP survives the compatibility checks further down is decided there,
+# not here; MTP_MODE is the raw request, MTP_ACTIVE the verdict.
+: "${MTP_ENABLED:=true}"
+: "${SPEC_DRAFT_N_MAX:=2}"
+
+
 case "${MMPROJ_ENABLED,,}" in
     1|true|yes|on) USE_MMPROJ=1 ;;
     *)             USE_MMPROJ=0 ;;
 esac
+
+# ----------------------------------------------------------------------------
+# MTP compatibility
+# ----------------------------------------------------------------------------
+# MTP is speculative decoding, and llama.cpp refuses to combine speculative
+# decoding with a loaded projector ("speculative decoding is not supported with
+# multimodal"), so MTP and MMPROJ_ENABLED cannot both be on. MTP also only
+# supports a single request slot today — upstream is explicit that multiple
+# `-np` values are not supported yet.
+#
+# Rather than let llama-server fail to start, the conflicts are resolved here
+# and reported loudly. Both conflicting settings are off/1 by default, so
+# hitting either means the operator asked for it deliberately — and the
+# deliberate choice is what survives. MTP, which is merely on by default, gives
+# way.
+case "${MTP_ENABLED,,}" in
+    1|true|yes|on) MTP_ACTIVE=1 ;;
+    *)             MTP_ACTIVE=0 ;;
+esac
+
+if [ "$MTP_ACTIVE" = 1 ]; then
+    if [ "$USE_MMPROJ" = 1 ]; then
+        echo ">> WARNING: MTP_ENABLED and MMPROJ_ENABLED are incompatible — llama.cpp cannot" >&2
+        echo ">>          run speculative decoding with a projector loaded. Keeping the" >&2
+        echo ">>          multimodal projector you asked for and disabling MTP." >&2
+        echo ">>          Set MMPROJ_ENABLED=false to get the MTP speedup back." >&2
+        MTP_ACTIVE=0
+    elif [ "$N_PARALLEL" != 1 ]; then
+        echo ">> WARNING: MTP does not support N_PARALLEL=${N_PARALLEL} — upstream only implements" >&2
+        echo ">>          a single slot so far. Keeping N_PARALLEL and disabling MTP." >&2
+        echo ">>          Set N_PARALLEL=1 to get the MTP speedup back." >&2
+        MTP_ACTIVE=0
+    fi
+fi
+
+# The MTP heads live in the weights, so a repo without them cannot draft. This
+# is a name heuristic, not a metadata check: it is meant to catch the common
+# mistake of enabling MTP against a plain GGUF, not to be authoritative.
+if [ "$MTP_ACTIVE" = 1 ] && [[ "${MODEL_REPO^^}" != *MTP* ]]; then
+    echo ">> WARNING: MTP_ENABLED is on but MODEL_REPO='${MODEL_REPO}' does not look like an" >&2
+    echo ">>          MTP build. The heads ship inside the weights, so unless this repo has" >&2
+    echo ">>          them llama-server will reject --spec-type draft-mtp." >&2
+    echo ">>          unsloth publishes '-MTP-GGUF' variants; set MTP_ENABLED=false otherwise." >&2
+fi
+
+if [ "$MTP_ACTIVE" = 1 ]; then
+    echo ">> MTP enabled: drafting up to ${SPEC_DRAFT_N_MAX} token(s) per step."
+fi
 
 MODELS_DIR="/models"
 MODEL_DIR="${MODELS_DIR}/${MODEL_ID}"
@@ -258,6 +320,22 @@ case "${REASONING_ENABLED,,}" in
     1|true|yes|on)  TUNING+=("--reasoning" "on") ;;
     0|false|no|off) TUNING+=("--reasoning" "off") ;;
 esac
+
+# Keep the reasoning of every assistant turn in the rendered prompt, not just
+# the newest one. Two reasons this is worth having in an agent loop: the model
+# can see how it reasoned through earlier tool calls, and — less obviously — the
+# prompt becomes append-only. Without it, each new user turn *removes* the
+# previous turn's <think> block from the history, changing the prefix and
+# throwing away everything --cache-reuse had cached from that point on.
+# 'auto' leaves the template's own default in place.
+case "${PRESERVE_REASONING,,}" in
+    1|true|yes|on)  TUNING+=("--reasoning-preserve") ;;
+    0|false|no|off) TUNING+=("--no-reasoning-preserve") ;;
+esac
+
+if [ "$MTP_ACTIVE" = 1 ]; then
+    TUNING+=("--spec-type" "draft-mtp" "--spec-draft-n-max" "$SPEC_DRAFT_N_MAX")
+fi
 
 if [ -n "$EXTRA_LLAMA_ARGS" ]; then
     # shellcheck disable=SC2206  # intentional word-splitting on spaces
