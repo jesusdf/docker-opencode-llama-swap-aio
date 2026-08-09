@@ -21,6 +21,11 @@ shopt -s nullglob
 : "${HF_TOKEN:=}"
 : "${CTX_SIZE:=262144}"
 : "${N_PREDICT:=8192}"
+# Number of request slots llama-server serves concurrently (--parallel). 1 keeps
+# the previous hardcoded behaviour. Note CTX_SIZE is the *total* KV budget shared
+# by the slots, not a per-slot figure, so raising this without raising CTX_SIZE
+# leaves each request with less room.
+: "${N_PARALLEL:=1}"
 : "${KV_CACHE_TYPE:=q8_0}"
 : "${MODEL_TTL:=900}"
 : "${TEMP:=0.7}"
@@ -292,7 +297,7 @@ ${MMPROJ_LINE}
       -ctk ${KV_CACHE_TYPE} -ctv ${KV_CACHE_TYPE}
       --ctx-size ${CTX_SIZE} --n-predict ${N_PREDICT}
       --temp ${TEMP} --top-p ${TOP_P} --top-k ${TOP_K}
-      --cache-reuse 256 --parallel 1
+      --cache-reuse 256 --parallel ${N_PARALLEL}
 ${TUNING_LINE}
     ttl: ${MODEL_TTL}
 YAML

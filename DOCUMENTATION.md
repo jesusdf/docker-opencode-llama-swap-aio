@@ -45,6 +45,7 @@ parameters and SSH key are all driven by environment variables.
 | `HF_TOKEN` | *(empty)* | Hugging Face token; only needed for gated/private repos. |
 | `CTX_SIZE` | `262144` | Context window (`--ctx-size`). |
 | `N_PREDICT` | `8192` | Max tokens to generate (`--n-predict`). |
+| `N_PARALLEL` | `1` | Concurrent request slots (`--parallel`). `1` suits a single opencode session. `CTX_SIZE` is the **total** KV budget shared by the slots, so raise both together or each request gets less context — and check the larger KV cache still fits in VRAM. |
 | `KV_CACHE_TYPE` | `q8_0` | KV cache quantization (`-ctk`/`-ctv`). |
 | `MODEL_TTL` | `900` | Seconds llama-swap keeps the model loaded while idle. |
 | `TEMP` / `TOP_P` / `TOP_K` | `0.7` / `0.95` / `64` | Sampling parameters. |
