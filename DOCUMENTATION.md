@@ -41,7 +41,7 @@ parameters and SSH key are all driven by environment variables.
 | `MODEL_QUANT` | `UD-IQ3_S` | Quant pattern to match when downloading (`*<MODEL_QUANT>*.gguf`). Split shards are picked up automatically. |
 | `MODEL_ID` | `qwen3.6-35b-a3b-mtp` | Internal name used for the llama-swap model (`swap/<MODEL_ID>`) and the opencode model. |
 | `MMPROJ_ENABLED` | `false` | Accept images/audio by loading the multimodal projector. **Off by default** because a loaded projector disables llama.cpp's prompt cache reuse, and because it is incompatible with MTP. See [the vision Q&A](#q-does-vision--multimodal-work). |
-| `MTP_ENABLED` | `true` | Multi-token prediction: the model drafts ahead with heads baked into its own weights. ~1.5-2x faster generation. Incompatible with `MMPROJ_ENABLED=true` and with `N_PARALLEL != 1`; either one makes the entrypoint warn and disable MTP. |
+| `MTP_ENABLED` | `auto` | Multi-token prediction: the model drafts ahead with heads baked into its own weights. ~1.5-2x faster generation. `auto` detects the heads in each GGUF and enables it only where present; `true` forces it everywhere, `false` never. Turned off for any model that loads a projector, and for all models when `N_PARALLEL != 1`. |
 | `SPEC_DRAFT_N_MAX` | `2` | Tokens drafted per step when MTP is on (`--spec-draft-n-max`). llama.cpp's own default is 3. |
 | `MMPROJ_QUANT` | `F16` | Which projector to download when the repo ships several (`BF16`/`F16`/`F32`). Empty downloads them all. Only used when `MMPROJ_ENABLED=true`. |
 | `HF_TOKEN` | *(empty)* | Hugging Face token; only needed for gated/private repos. |
@@ -493,20 +493,21 @@ refuses with *"speculative decoding is not supported with multimodal"*. MTP is
 speculative decoding, so `MMPROJ_ENABLED=true` and `MTP_ENABLED=true` are
 mutually exclusive.
 
-Rather than let llama-server fail to start, `init-llama-swap.sh` resolves it:
-both settings are off/1 by default, so if you turned the projector on you did it
-deliberately, and that is what survives. MTP is disabled and the reason is
-printed in the log:
+Rather than let llama-server fail to start, `init-llama-swap.sh` resolves it in
+favour of the projector — you turned that on deliberately — and says so:
 
 ```
->> WARNING: MTP_ENABLED and MMPROJ_ENABLED are incompatible — llama.cpp cannot
->>          run speculative decoding with a projector loaded. Keeping the
->>          multimodal projector you asked for and disabling MTP.
->>          Set MMPROJ_ENABLED=false to get the MTP speedup back.
+>> qwen3.6-35b-a3b-mtp: MTP off — llama.cpp cannot run speculative decoding with a
+>>   projector loaded. Set MMPROJ_ENABLED=false to trade vision for speed.
 ```
 
-So turning on vision costs you twice over: prompt cache reuse *and* roughly
-1.5-2x of generation speed. Worth knowing before you flip it.
+This is decided **per model**, not globally: only a model that actually receives
+an `--mmproj` loses MTP, so a text-only model served alongside it keeps its
+speedup.
+
+So turning on vision costs you twice over on the models it applies to: prompt
+cache reuse *and* roughly 1.5-2x of generation speed. Worth knowing before you
+flip it.
 
 Switching it on later is safe: the projector download is tracked separately from
 the weights, so a model that is already on disk gets its projector fetched on
@@ -680,9 +681,8 @@ against the main head in a single pass — speculative decoding with **no separa
 draft model**. unsloth reports ~1.5-2x faster generation with no accuracy loss.
 It landed in llama.cpp in May 2026 ([PR #22673](https://github.com/ggml-org/llama.cpp/pull/22673)).
 
-It is **on by default** here, which is why `MODEL_REPO` defaults to an
-`-MTP-GGUF` build: the heads ship inside the weights, so a plain `-GGUF` repo
-has nothing to draft with. The generated `cmd:` gets:
+`MODEL_REPO` defaults to an `-MTP-GGUF` build so the capability is there out of
+the box. Models that get it have this added to their `cmd:`:
 
 ```
 --spec-type draft-mtp --spec-draft-n-max 2
@@ -692,21 +692,53 @@ has nothing to draft with. The generated `cmd:` gets:
 default is 3 and unsloth recommends 2; more pays off when the acceptance rate is
 high and costs when it is not, so measure both on your GPU.
 
+### `auto`: decided per model, from the weights
+
+MTP is a property of the **weights**, not of the stack, and this stack serves
+every model it finds under `/models` — so a mixed set is the normal case. With
+`MTP_ENABLED=auto` (the default) each model is checked on its own and only the
+capable ones get the flags.
+
+The check reads the front of the GGUF and looks for the two markers llama.cpp
+keys on: the `{arch}.nextn_predict_layers` metadata entry, and `blk.N.nextn.*`
+tensor names. Both are plain strings in the GGUF header, so a bounded 8 MiB read
+finds them without a full GGUF parser — the metadata entry in particular sits
+very early (byte ~2,000 in `Qwen3.6-35B-A3B`, against an 8 MiB window).
+
+Every decision is printed at startup:
+
+```
+>> Found model 'qwen3.6-35b-a3b-mtp': /models/…/Qwen3.6-35B-A3B-UD-IQ3_S.gguf (+MTP, drafting 2)
+>> gemma4-12b: no MTP heads in the weights — MTP off for this model.
+```
+
+`true` skips detection and forces the flags on everywhere — useful if a model
+carries the heads under names this check does not know yet. You get a warning
+per model where detection disagreed, because llama-server will most likely
+reject `--spec-type draft-mtp` for those. `false` never enables it.
+
+If the header cannot be read at all, `auto` leaves MTP off and says so, rather
+than guessing.
+
 ### What turns it off
 
-Two settings are incompatible with MTP. Rather than let llama-server fail to
-start, `init-llama-swap.sh` detects each one, prints why, and disables MTP —
-both conflicting settings are off/1 by default, so hitting one means you asked
-for it deliberately, and the deliberate choice wins:
+Two things are incompatible with MTP. Rather than let llama-server fail to
+start, `init-llama-swap.sh` detects each one and prints why. Both are off/1 by
+default, so hitting one means you asked for it deliberately — and the deliberate
+choice wins:
 
-| Setting | Why | What happens |
-|---|---|---|
-| `MMPROJ_ENABLED=true` | llama.cpp will not run speculative decoding with a projector loaded | MTP off, vision kept |
-| `N_PARALLEL != 1` | upstream only implements a single slot for MTP so far | MTP off, slots kept |
+| Setting | Why | Scope | What happens |
+|---|---|---|---|
+| `MMPROJ_ENABLED=true` | llama.cpp will not run speculative decoding with a projector loaded | **per model** — only models that actually receive an `--mmproj` | MTP off for those, vision kept |
+| `N_PARALLEL != 1` | upstream only implements a single slot for MTP so far | **global** — `--parallel` is one flag for the whole server | MTP off everywhere, slots kept |
 
-There is also a name check: if `MTP_ENABLED=true` but `MODEL_REPO` does not look
-like an MTP build, you get a warning and the run continues, because the name is
-a heuristic and only the GGUF metadata is authoritative.
+The `N_PARALLEL` check runs whenever MTP could be used at all, `auto` included:
+
+```
+>> WARNING: MTP requires --parallel 1 and N_PARALLEL is 4 — upstream only
+>>          implements a single slot so far. Keeping N_PARALLEL and disabling MTP
+>>          for every model. Set N_PARALLEL=1 to get the MTP speedup back.
+```
 
 ### Requirements
 

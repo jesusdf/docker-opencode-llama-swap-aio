@@ -194,19 +194,32 @@ inference is wrong, and measured:
 10. **`opencode.json` is generated once** and left for the user to edit; changing
     `MODEL_ID` later means the user must delete/regen it. The llama-swap
     `config.yaml`, by contrast, is regenerated every start.
-11. **MTP is speculative decoding, and it is on by default.** Three constraints
-    that are easy to break:
-    - **Incompatible with `MMPROJ_ENABLED=true`** — llama.cpp refuses
-      speculative decoding with a projector loaded.
-    - **Incompatible with `N_PARALLEL != 1`** — upstream implements one slot.
-    - **Needs the heads in the weights** (`-MTP-GGUF` repos), which is why
-      `MODEL_REPO` defaults to one.
+11. **MTP is decided per model, not globally.** `MTP_ENABLED` is
+    `auto|true|false`, default `auto`. MTP is a property of the *weights*, and
+    the stack serves every model under `/models`, so the flags go into each
+    model's own `cmd:` block (`MODEL_MTPS[]`, alongside `MODEL_MMPROJS[]`) —
+    never into the shared `TUNING`. Scope of each constraint differs, and that
+    distinction matters:
+    - **`MMPROJ_ENABLED=true` → per model.** llama.cpp refuses speculative
+      decoding with a projector loaded, but only models that actually get an
+      `--mmproj` are affected.
+    - **`N_PARALLEL != 1` → global.** `--parallel` is one flag for the whole
+      server, so it takes MTP out everywhere. Check it whenever MTP could be
+      used *at all*, `auto` included — not just when forced on.
+
+    Detection reads the first 8 MiB of the GGUF for `nextn_predict_layers` (the
+    `{arch}.` metadata key) or `.nextn.` (tensor names) — the same markers other
+    tools key on. Both are plain strings in the header, so no GGUF parser is
+    needed; the metadata key lands at byte ~2k in Qwen3.6-35B-A3B. Verified
+    against real headers from both the `-MTP-GGUF` and plain repos.
+
+    `mtp_supported()` returns 0/1/2 (yes/no/unreadable), so **call it as
+    `rc=0; mtp_supported "$f" || rc=$?`** — a bare call aborts under `set -e`.
 
     Resolve conflicts by **disabling MTP and keeping the other setting**, with a
-    loud `>> WARNING:` on stderr. The rule is "the deliberate choice wins": both
-    conflicting settings are off/1 by default, so hitting one means the operator
-    asked for it. Never let llama-server fail to start over a config conflict we
-    could have caught.
+    loud warning. The rule is "the deliberate choice wins": both conflicting
+    settings are off/1 by default, so hitting one means the operator asked for
+    it. Never let llama-server fail to start over a conflict we could catch.
 12. **Reasoning config lives on both sides and must agree.** `PRESERVE_REASONING`
     emits `--reasoning-preserve` in the llama-swap `cmd:` *and*
     `chat_template_kwargs.preserve_thinking` in `opencode.json`. That is not

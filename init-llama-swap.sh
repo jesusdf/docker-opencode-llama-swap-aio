@@ -52,13 +52,14 @@ shopt -s nullglob
 
 # Multi-token prediction. The model drafts the next few tokens with its own
 # built-in MTP heads and verifies them in one pass — speculative decoding with
-# no separate draft model. Requires a GGUF that ships the heads (the "-MTP-"
-# repos) and a llama.cpp new enough to have `--spec-type` (merged 2026-05).
-# Whether MTP survives the compatibility checks further down is decided there,
-# not here; MTP_MODE is the raw request, MTP_ACTIVE the verdict.
-: "${MTP_ENABLED:=true}"
+# no separate draft model. Needs weights that ship the heads and a llama.cpp new
+# enough to have `--spec-type` (merged 2026-05).
+#
+# auto|true|false. 'auto' means "wherever the weights support it", which is
+# resolved per model further down — MTP_MODE holds the request, MODEL_MTPS[] the
+# per-model verdict.
+: "${MTP_ENABLED:=auto}"
 : "${SPEC_DRAFT_N_MAX:=2}"
-
 
 case "${MMPROJ_ENABLED,,}" in
     1|true|yes|on) USE_MMPROJ=1 ;;
@@ -66,52 +67,62 @@ case "${MMPROJ_ENABLED,,}" in
 esac
 
 # ----------------------------------------------------------------------------
-# MTP compatibility
+# MTP: global gate
 # ----------------------------------------------------------------------------
-# MTP is speculative decoding, and llama.cpp refuses to combine speculative
-# decoding with a loaded projector ("speculative decoding is not supported with
-# multimodal"), so MTP and MMPROJ_ENABLED cannot both be on. MTP also only
-# supports a single request slot today — upstream is explicit that multiple
-# `-np` values are not supported yet.
+# Whether MTP may be used at all. The per-model decision happens later, once the
+# GGUFs have been discovered — MTP is a property of the weights, and this stack
+# can serve several models at once.
 #
-# Rather than let llama-server fail to start, the conflicts are resolved here
-# and reported loudly. Both conflicting settings are off/1 by default, so
-# hitting either means the operator asked for it deliberately — and the
-# deliberate choice is what survives. MTP, which is merely on by default, gives
-# way.
+#   auto  - use it on each model that actually ships the heads (the default)
+#   true  - force it on every model, whatever detection says
+#   false - never
 case "${MTP_ENABLED,,}" in
-    1|true|yes|on) MTP_ACTIVE=1 ;;
-    *)             MTP_ACTIVE=0 ;;
+    1|true|yes|on)  MTP_MODE=true ;;
+    0|false|no|off) MTP_MODE=false ;;
+    *)              MTP_MODE=auto ;;
 esac
 
-if [ "$MTP_ACTIVE" = 1 ]; then
-    if [ "$USE_MMPROJ" = 1 ]; then
-        echo ">> WARNING: MTP_ENABLED and MMPROJ_ENABLED are incompatible — llama.cpp cannot" >&2
-        echo ">>          run speculative decoding with a projector loaded. Keeping the" >&2
-        echo ">>          multimodal projector you asked for and disabling MTP." >&2
-        echo ">>          Set MMPROJ_ENABLED=false to get the MTP speedup back." >&2
-        MTP_ACTIVE=0
-    elif [ "$N_PARALLEL" != 1 ]; then
-        echo ">> WARNING: MTP does not support N_PARALLEL=${N_PARALLEL} — upstream only implements" >&2
-        echo ">>          a single slot so far. Keeping N_PARALLEL and disabling MTP." >&2
-        echo ">>          Set N_PARALLEL=1 to get the MTP speedup back." >&2
-        MTP_ACTIVE=0
-    fi
+# MTP is speculative decoding, and llama.cpp only implements a single request
+# slot for it so far — upstream is explicit that multiple `-np` values are not
+# supported yet. `--parallel` is one flag for the whole server, so unlike the
+# projector this cannot be decided per model: it takes MTP out entirely.
+#
+# N_PARALLEL is 1 by default, so anything else was asked for deliberately and is
+# what survives; MTP gives way rather than letting llama-server fail to start.
+if [ "$MTP_MODE" != false ] && [ "$N_PARALLEL" != 1 ]; then
+    echo ">> WARNING: MTP requires --parallel 1 and N_PARALLEL is ${N_PARALLEL} — upstream only" >&2
+    echo ">>          implements a single slot so far. Keeping N_PARALLEL and disabling MTP" >&2
+    echo ">>          for every model. Set N_PARALLEL=1 to get the MTP speedup back." >&2
+    MTP_MODE=false
 fi
 
-# The MTP heads live in the weights, so a repo without them cannot draft. This
-# is a name heuristic, not a metadata check: it is meant to catch the common
-# mistake of enabling MTP against a plain GGUF, not to be authoritative.
-if [ "$MTP_ACTIVE" = 1 ] && [[ "${MODEL_REPO^^}" != *MTP* ]]; then
-    echo ">> WARNING: MTP_ENABLED is on but MODEL_REPO='${MODEL_REPO}' does not look like an" >&2
-    echo ">>          MTP build. The heads ship inside the weights, so unless this repo has" >&2
-    echo ">>          them llama-server will reject --spec-type draft-mtp." >&2
-    echo ">>          unsloth publishes '-MTP-GGUF' variants; set MTP_ENABLED=false otherwise." >&2
-fi
+# Does this GGUF carry multi-token prediction heads?
+#
+# Two markers, the same pair other tools key on: the `{arch}.nextn_predict_layers`
+# metadata entry, and `blk.N.nextn.*` tensor names. Both are plain strings in the
+# GGUF header, so a bounded read of the front of the file finds them without
+# needing a full GGUF parser — and the metadata key in particular lands very
+# early (byte ~2k in Qwen3.6-35B-A3B, against an 8 MiB window).
+#
+# Exit status: 0 supported, 1 not supported, 2 could not tell.
+mtp_supported() {
+    python3 - "$1" <<'PY'
+import sys
 
-if [ "$MTP_ACTIVE" = 1 ]; then
-    echo ">> MTP enabled: drafting up to ${SPEC_DRAFT_N_MAX} token(s) per step."
-fi
+WINDOW = 8 << 20
+
+try:
+    with open(sys.argv[1], "rb") as fh:
+        head = fh.read(WINDOW)
+except OSError:
+    sys.exit(2)
+
+if not head.startswith(b"GGUF"):
+    sys.exit(2)
+
+sys.exit(0 if (b"nextn_predict_layers" in head or b".nextn." in head) else 1)
+PY
+}
 
 MODELS_DIR="/models"
 MODEL_DIR="${MODELS_DIR}/${MODEL_ID}"
@@ -249,7 +260,7 @@ resolve_mmproj() {
 # named after the directory — so MODEL_ID/MODEL_REPO only decide what gets
 # *downloaded*, while anything already sitting in /models is served too.
 # ----------------------------------------------------------------------------
-declare -a MODEL_IDS=() MODEL_FILES=() MODEL_MMPROJS=()
+declare -a MODEL_IDS=() MODEL_FILES=() MODEL_MMPROJS=() MODEL_MTPS=()
 
 for dir in "$MODELS_DIR"/*/; do
     dir="${dir%/}"
@@ -265,11 +276,50 @@ for dir in "$MODELS_DIR"/*/; do
     mmproj_file=""
     [ "$USE_MMPROJ" = 1 ] && mmproj_file="$(resolve_mmproj "$dir")"
 
+    # --- MTP, decided per model -------------------------------------------
+    # The heads live in the weights, so this is the model's property, not the
+    # stack's. The projector check is per model too: llama.cpp refuses
+    # speculative decoding only for a model that actually gets an --mmproj, so
+    # a text-only model served alongside a multimodal one keeps its speedup.
+    mtp=0
+    if [ "$MTP_MODE" != false ]; then
+        if [ -n "$mmproj_file" ]; then
+            echo ">> ${id}: MTP off — llama.cpp cannot run speculative decoding with a" >&2
+            echo ">>   projector loaded. Set MMPROJ_ENABLED=false to trade vision for speed." >&2
+        else
+            # `|| rc=$?` and not a bare call: a 1/2 exit is data here, and
+            # under `set -e` a bare call would abort the script instead.
+            rc=0
+            mtp_supported "$file" || rc=$?
+            case "$rc:$MTP_MODE" in
+                0:*)
+                    mtp=1 ;;
+                1:true)
+                    mtp=1
+                    echo ">> WARNING: ${id}: MTP_ENABLED=true but no MTP heads found in the weights." >&2
+                    echo ">>   Forcing it on as asked; llama-server will likely reject --spec-type" >&2
+                    echo ">>   draft-mtp. Use MTP_ENABLED=auto to enable it only where supported." >&2 ;;
+                1:auto)
+                    echo ">> ${id}: no MTP heads in the weights — MTP off for this model." ;;
+                2:true)
+                    mtp=1
+                    echo ">> WARNING: ${id}: could not read the GGUF header to check for MTP heads." >&2
+                    echo ">>   Forcing it on because MTP_ENABLED=true." >&2 ;;
+                2:auto)
+                    echo ">> WARNING: ${id}: could not read the GGUF header to check for MTP heads;" >&2
+                    echo ">>   leaving MTP off. Set MTP_ENABLED=true to force it." >&2 ;;
+            esac
+        fi
+    fi
+
     MODEL_IDS+=("$id")
     MODEL_FILES+=("$file")
     MODEL_MMPROJS+=("$mmproj_file")
+    MODEL_MTPS+=("$mtp")
 
-    echo ">> Found model '${id}': ${file}${mmproj_file:+ (+mmproj ${mmproj_file})}"
+    mtp_note=""
+    [ "$mtp" = 1 ] && mtp_note=" (+MTP, drafting ${SPEC_DRAFT_N_MAX})"
+    echo ">> Found model '${id}': ${file}${mmproj_file:+ (+mmproj ${mmproj_file})}${mtp_note}"
 done
 
 if [ ${#MODEL_IDS[@]} -eq 0 ]; then
@@ -333,9 +383,8 @@ case "${PRESERVE_REASONING,,}" in
     0|false|no|off) TUNING+=("--no-reasoning-preserve") ;;
 esac
 
-if [ "$MTP_ACTIVE" = 1 ]; then
-    TUNING+=("--spec-type" "draft-mtp" "--spec-draft-n-max" "$SPEC_DRAFT_N_MAX")
-fi
+# NOTE: the MTP flags are deliberately NOT here. They are per model — see the
+# discovery loop above — and are emitted into each model's own cmd: block.
 
 if [ -n "$EXTRA_LLAMA_ARGS" ]; then
     # shellcheck disable=SC2206  # intentional word-splitting on spaces
@@ -363,6 +412,11 @@ echo ">> Extra llama-server flags:${TUNING_LINE:- (none)}"
     for i in "${!MODEL_IDS[@]}"; do
         MMPROJ_LINE=""
         [ -n "${MODEL_MMPROJS[$i]}" ] && MMPROJ_LINE="      --mmproj ${MODEL_MMPROJS[$i]}"
+        # Per model, not shared: only the models whose weights carry the heads
+        # get the speculative-decoding flags.
+        MTP_LINE=""
+        [ "${MODEL_MTPS[$i]}" = 1 ] && \
+            MTP_LINE="      --spec-type draft-mtp --spec-draft-n-max ${SPEC_DRAFT_N_MAX}"
         cat <<YAML
   "swap/${MODEL_IDS[$i]}":
     name: "${MODEL_IDS[$i]}"
@@ -376,6 +430,7 @@ ${MMPROJ_LINE}
       --ctx-size ${CTX_SIZE} --n-predict ${N_PREDICT}
       --temp ${TEMP} --top-p ${TOP_P} --top-k ${TOP_K}
       --cache-reuse 256 --parallel ${N_PARALLEL}
+${MTP_LINE}
 ${TUNING_LINE}
     ttl: ${MODEL_TTL}
 YAML
