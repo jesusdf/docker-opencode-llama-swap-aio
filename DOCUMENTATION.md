@@ -676,7 +676,8 @@ So the generated `opencode.json` looks like this for `REASONING_ENABLED=true`:
 ```json
 "options": {
   "reasoningEffort": "high",
-  "chat_template_kwargs": { "reasoning_effort": "high", "enable_thinking": true }
+  "chat_template_kwargs": { "reasoning_effort": "high", "enable_thinking": true },
+  "extraBody": { "think": "high" }
 }
 ```
 
@@ -685,6 +686,12 @@ and like this for `false` (no point advertising an effort level you're disabling
 ```json
 "options": { "chat_template_kwargs": { "enable_thinking": false } }
 ```
+
+`extraBody` is a third route to the same setting: the provider merges it into
+the request body verbatim, and `think` is the field some llama.cpp builds and
+proxies read instead of `chat_template_kwargs`. All three carry the same
+`REASONING_EFFORT` value, so whichever one the server actually honours agrees
+with the other two. Sent only when reasoning is on.
 
 Remember `opencode.json` is only regenerated when missing or when
 `REGENERATE_OPENCODE_CONFIG=true` — set that after changing either variable.

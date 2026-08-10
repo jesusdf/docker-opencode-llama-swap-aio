@@ -186,7 +186,16 @@ else:
 
     # `reasoningEffort` is kept as well: harmless here, and correct if this
     # config is ever pointed at a provider that does honour it.
-    model_options = {"reasoningEffort": effort, "chat_template_kwargs": kwargs}
+    #
+    # `extraBody` is a third route to the same setting: the provider merges it
+    # into the request body verbatim, and `think` is the field some llama.cpp
+    # builds and proxies read instead of `chat_template_kwargs`. Same effort
+    # level as everything else, so whichever one the server honours agrees.
+    model_options = {
+        "reasoningEffort": effort,
+        "chat_template_kwargs": kwargs,
+        "extraBody": {"think": effort},
+    }
 
 # Attachment support follows MMPROJ_ENABLED, and applies to every model.
 #
