@@ -1,0 +1,290 @@
+# ---------------------------------------------------------------------------
+# Model / llama-swap configuration
+# ---------------------------------------------------------------------------
+# Hugging Face GGUF repo and the quant pattern to download.
+# The default is an MTP build (see MTP_ENABLED below): the multi-token
+# prediction heads ship inside these weights. A plain "-GGUF" repo works fine
+# too — MTP defaults to 'auto', which detects the heads and simply leaves the
+# flags off for models that do not have them.
+
+# NVIDIA 5060ti 16GB
+# https://huggingface.co/unsloth/gpt-oss-20b-GGUF/blob/df82eebe42677e286dbeef9f484cea7bf7e65044/gpt-oss-20b-MXFP4.gguf
+
+MODEL_REPO=unsloth/gpt-oss-20b-GGUF
+MODEL_QUANT=MXFP4
+# Internal id used for the llama-swap model name and the opencode model
+MODEL_ID=gpt-oss-20b
+
+# --- Multimodal input (vision / audio) ------------------------------------
+# Load the multimodal projector (mmproj) so the model can accept images and
+# audio. Off by default, and that default is deliberate: llama.cpp disables
+# prompt cache reuse (--cache-reuse) whenever a projector is loaded, so every
+# request reprocesses the whole prompt from scratch. In a coding session — long
+# context, many turns, no images — that is a large, permanent slowdown in
+# exchange for a capability you are unlikely to use.
+#
+# It is also mutually exclusive with MTP: llama.cpp refuses to run speculative
+# decoding with a projector loaded, so any model that gets a projector loses MTP
+# — trading ~1.5-2x generation speed for image/audio input. Decided per model,
+# so a text-only model in /models keeps its speedup either way.
+#
+# Applied on both sides: llama-server only gets --mmproj when this is true, and
+# opencode only advertises attachment/image/audio support when it is true.
+# Turning it on later re-runs the projector download for the model in
+# MODEL_REPO, so no need to delete anything.
+MMPROJ_ENABLED=false
+
+# Which multimodal projector (mmproj) to download when the repo ships several —
+# unsloth publishes BF16, F16 and F32, and without this you would download all
+# three and get an arbitrary one. F16 is the usual balance. Matching is
+# case-insensitive and boundary-aware, so F16 does not pull BF16. Leave empty to
+# download every projector the repo has. Ignored when MMPROJ_ENABLED is false,
+# and for text-only models, which have no projector.
+MMPROJ_QUANT=F16
+# Optional Hugging Face token (needed for gated/private repos)
+HF_TOKEN=
+
+# Inference parameters
+CTX_SIZE=65536
+N_PREDICT=8192
+
+# How many requests llama-server handles at once (--parallel). 1 is the right
+# answer for a single interactive opencode session and is what this stack has
+# always used. Raise it only if something else shares the model — a second
+# session, an editor plugin, a script.
+#
+# CTX_SIZE is the *total* KV budget shared by the slots, not a per-slot value,
+# so N_PARALLEL=2 without touching CTX_SIZE roughly halves what each request
+# gets. Scale CTX_SIZE with it, and remember the KV cache grows accordingly:
+# check you still fit in VRAM (see the VRAM tuning section below).
+#
+# Leaving this at 1 is also a precondition for MTP — see below.
+N_PARALLEL=1
+
+# --- MTP (multi-token prediction) -----------------------------------------
+# The model drafts the next few tokens using prediction heads baked into its own
+# weights, then verifies them in a single pass: speculative decoding without a
+# separate draft model. unsloth reports ~1.5-2x faster generation with no
+# accuracy loss. Needs a build that ships the heads — the "-MTP-GGUF" variants,
+# which is what MODEL_REPO defaults to above.
+#
+#   auto  - enable it on each model whose weights actually carry the heads
+#   true  - force it on every model, whatever the weights say
+#   false - never
+#
+# 'auto' is the default and is decided **per model**, by reading the GGUF header
+# and looking for the markers llama.cpp uses (the {arch}.nextn_predict_layers
+# metadata entry and blk.N.nextn.* tensors). This stack serves every model under
+# /models, so a mixed set is normal: the MTP ones get the flags, the others do
+# not. Each decision is printed at startup.
+#
+# Two things switch it off, and init-llama-swap.sh warns rather than letting
+# llama-server fail to start:
+#   - MMPROJ_ENABLED=true — llama.cpp will not run speculative decoding with a
+#     projector loaded. Checked per model, so a text-only model served next to a
+#     multimodal one keeps its speedup.
+#   - N_PARALLEL != 1 — upstream only implements a single slot for MTP so far.
+#     --parallel is one flag for the whole server, so this disables MTP for
+#     every model, not just one.
+MTP_ENABLED=auto
+
+# How many tokens to draft per step. Upstream's llama.cpp default is 3; unsloth
+# recommends 2 for these models. Higher pays off when the draft acceptance rate
+# is high and costs when it is not, so it is worth measuring both on your GPU.
+SPEC_DRAFT_N_MAX=2
+KV_CACHE_TYPE=q8_0
+MODEL_TTL=900
+
+# Sampling. These match what Qwen recommends for Qwen3.6 in thinking + coding
+# mode, which is what MODEL_REPO defaults to. Note the card gives *different*
+# numbers for general thinking use (temp 1.0, top_k 20, presence_penalty 1.5) —
+# these are the coding ones. Revisit them if you switch to another model
+# family; they are not universal.
+TEMP=0.6
+TOP_P=0.95
+TOP_K=20
+# --- Reasoning / thinking -------------------------------------------------
+# Whether the model should think before answering.
+#   auto  - let the model's chat template decide (llama-server's own default)
+#   true  - force thinking on
+#   false - force thinking off
+# Applied on both sides: llama-server gets --reasoning on|off, and opencode
+# sends chat_template_kwargs.enable_thinking, which is the boolean Qwen3,
+# DeepSeek-R1 and GLM templates read.
+REASONING_ENABLED=auto
+
+# How hard to think, when thinking is on (low | medium | high). Sent three ways,
+# all carrying this same value, because different servers read different fields:
+# chat_template_kwargs.reasoning_effort (what the gpt-oss family reads),
+# extraBody.think, and opencode's own reasoningEffort. Whatever ignores one of
+# them simply drops it. Ignored entirely when REASONING_ENABLED is false.
+REASONING_EFFORT=high
+
+# Keep the reasoning of *every* assistant turn in the prompt, instead of only
+# the most recent one (the usual template behaviour).
+#   auto  - leave the chat template's own default alone
+#   true  - preserve the whole trace
+#   false - force the trace to be dropped from older turns
+#
+# On by default for two reasons. The model gets to see how it reasoned through
+# earlier tool calls, which is what you want in an agent loop; and the prompt
+# becomes append-only, which matters more than it sounds. Without it, every new
+# user turn *removes* the previous turn's thinking from the history, so the
+# prefix changes and --cache-reuse throws away everything it had cached from
+# that point on.
+#
+# The cost is context: reasoning traces accumulate, so long sessions fill
+# CTX_SIZE sooner. Set it to false if you would rather have the room.
+#
+# Applied on both sides: llama-server gets --reasoning-preserve, and opencode
+# also sends chat_template_kwargs.preserve_thinking, which is the variable
+# Qwen3.6's template reads. Ignored when REASONING_ENABLED is false.
+PRESERVE_REASONING=true
+
+# --- VRAM tuning ----------------------------------------------------------
+# Reach for these when a model barely fits (or doesn't) in VRAM. The defaults
+# below keep everything on the GPU, which is the fastest setup.
+#
+# Before touching any of them, try lowering CTX_SIZE: at large context lengths
+# the KV cache usually costs more VRAM than the weights themselves.
+
+# Only spill to RAM when you actually have to. Each model is sized up against
+# the VRAM free at startup, and the ones that fit whole are served with
+# everything on the GPU — N_GPU_LAYERS, CPU_MOE, N_CPU_MOE, OVERRIDE_TENSOR and
+# KV_OFFLOAD are all skipped for them, because each of those buys VRAM by giving
+# up speed and there is nothing to buy. Models that do not fit get the settings
+# exactly as configured below.
+#
+# Decided per model, so a small model and a large one can share /models and each
+# gets the right treatment. What is measured: the GGUF (all shards) plus the KV
+# cache the model will allocate at CTX_SIZE, computed from the GGUF's own
+# metadata, plus the projector when one is loaded.
+#
+# It is an estimate, and it is deliberately cautious: anything that cannot be
+# measured — no nvidia-smi and no AMD counters, an unreadable header, missing
+# metadata — counts as "does not fit", so the settings stay applied and the
+# model stays loadable. Every decision is printed at startup.
+#
+# On by default, because that cautious fallback is exactly the behaviour you get
+# with it off: the worst case is that nothing is optimised. Set it to false if
+# you would rather your settings be honoured verbatim, or if you share the GPU
+# with something that grabs VRAM after this container starts.
+VRAM_TRY_AUTOFIT=true
+
+# Headroom the estimate leaves free, in MiB. It covers what the weights+KV
+# figure does not: llama.cpp's compute buffers, the CUDA/HIP context and
+# fragmentation. Raise it if a model is judged to fit and then fails to load.
+VRAM_AUTOFIT_MARGIN_MIB=600
+
+# Layers to keep in VRAM. 99 means "all"; lower it to push the remainder to RAM.
+# The simplest lever, and the most costly in speed.
+N_GPU_LAYERS=99
+
+# Mixture-of-Experts models only, and by far the best VRAM/quality trade-off for
+# them: keep the expert weights in RAM while attention stays on the GPU.
+#   CPU_MOE=true  -> all experts to CPU (-cmoe)
+#   N_CPU_MOE=N   -> only the first N layers' experts (-ncmoe), finer grained
+# CPU_MOE wins if both are set. Leave both unset for a dense model.
+CPU_MOE=false
+N_CPU_MOE=
+
+# Fine-grained placement by tensor-name regex (-ot), for when the two knobs
+# above are too coarse. No spaces allowed in the value.
+# Example: OVERRIDE_TENSOR=\.ffn_(up|down|gate)_exps\.=CPU
+OVERRIDE_TENSOR=blk\.([0-8])\.ffn_(gate|up|down)_exps\.=CPU,blk\.9\.ffn_(gate|up)_exps\.=CPU
+
+# Keep the KV cache in RAM instead of VRAM (-nkvo). Frees a lot at large
+# CTX_SIZE but is usually a big slowdown — a last resort.
+KV_OFFLOAD=true
+
+# Escape hatch appended verbatim to every llama-server command line, for flags
+# that have no variable here. Space-separated; no quoting or spaces in values.
+EXTRA_LLAMA_ARGS=--threads 8
+
+# Rewrite ~/.config/opencode/opencode.json on every container start so changes
+# to the variables above take effect. Any manual edits to that file are lost.
+# Leave false to generate it only when it does not exist.
+REGENERATE_OPENCODE_CONFIG=true
+
+# API key that protects the llama-swap endpoint (also used by opencode).
+# Leave empty to disable authentication.
+LLAMA_API_KEY=sk-my_api_key
+
+# ---------------------------------------------------------------------------
+# opencode build (build time only — needs docker-compose.build.yml)
+# ---------------------------------------------------------------------------
+# opencode is compiled from source inside the image instead of being installed
+# from npm, because the published npm binary carries libopentui.so embedded and
+# unpacks it into a temporary directory on every start — which is what produces
+# "Failed to initialize OpenTUI render library" on hosts where that directory is
+# missing or mounted noexec.
+#
+# Git revision to compile: a tag, a branch or a full commit SHA. Builds are
+# pinned, so the same value always produces the same opencode; bump it to move.
+# These two only reach the build, not the running container, so they do nothing
+# when you pull the published image — they need the build override:
+#
+#   docker compose -f docker-compose.nvidia.yml -f docker-compose.build.yml up -d --build
+#
+# Leave both commented to use the revision pinned in the Dockerfile.
+#OPENCODE_REF=v1.18.15
+
+# Version string reported by `opencode --version`. Derived from OPENCODE_REF
+# when empty ("vX.Y.Z" -> "X.Y.Z", anything else -> "0.0.0-<short sha>"), which
+# is almost always what you want.
+#OPENCODE_VERSION=
+
+# ---------------------------------------------------------------------------
+# User / runtime
+# ---------------------------------------------------------------------------
+PUID=1000
+PGID=1000
+TZ=Europe/Madrid
+
+# Extra OS packages to install into the opencode container at boot (Debian apt,
+# space-separated). Installed by entrypoint.sh before sshd starts. Leave empty
+# to install nothing. Example: APT_PACKAGES="vim tmux ripgrep"
+APT_PACKAGES=vim screen wget btop htop curl
+
+# Root-run init hook, executed by entrypoint.sh before sshd starts. The image
+# ships no sudo, so this is how you make root-level tweaks (config files,
+# services, anything APT_PACKAGES cannot express). The container path below is
+# what gets executed; it is skipped if the file does not exist, and refused if
+# it is writable by the unprivileged 'user' account.
+INIT_SCRIPT=/opt/init/init.sh
+
+# Block the agent from reaching the local network (RFC1918 ranges 10.x, 172.16-31.x,
+# 192.168.x plus link-local 169.254.x, which includes the cloud metadata endpoint).
+# Internet access and llama-swap stay reachable. Requires NET_ADMIN, already
+# granted in the compose files. Rules are installed before INIT_SCRIPT runs, so
+# your init script can add exceptions with plain iptables commands.
+BLOCK_LOCAL_NETWORK=true
+
+# Internal URL opencode uses to reach llama-swap (compose service name)
+LLAMA_SWAP_URL=http://llama-swap:8080
+
+# AMD/ROCm only: force the gfx target for GPUs not in the official ROCm support
+# list (common for consumer RDNA cards). Leave commented for NVIDIA.
+# gfx1100 -> 11.0.0, gfx1030 -> 10.3.0, etc.
+#HSA_OVERRIDE_GFX_VERSION=11.0.0
+
+# ---------------------------------------------------------------------------
+# Host paths
+# ---------------------------------------------------------------------------
+# Where the interactive user's home directory is persisted on the HOST. It is
+# mounted at /home/user inside the container; the container-side path is fixed
+# and does not follow this variable.
+USER_HOME_PATH=/home/docker/opencode
+# Host directory mounted read-only at /opt/init, holding the init.sh hook above.
+# Keep it owned by root and outside USER_HOME_PATH, or the hook is refused.
+INIT_PATH=/home/docker/docker-opencode-llama-swap-aio/init
+# Where downloaded models and the generated config live on the host
+MODELS_PATH=/home/docker/llama-swap/models
+
+# ---------------------------------------------------------------------------
+# SSH access to the opencode container
+# ---------------------------------------------------------------------------
+# Host port mapped to the container's SSH (22). Set to 22 to expose it directly.
+SSH_PORT=2222
+# Authorized public key allowed to log in (user: "user")
+SSH_PUBLIC_KEY=ssh-rsa AAAA...
