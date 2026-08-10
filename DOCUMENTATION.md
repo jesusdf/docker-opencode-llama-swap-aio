@@ -402,11 +402,61 @@ the GPU, which is what the stack did before these existed.
 | `OVERRIDE_TENSOR` | `-ot` | Placement by tensor-name regex, when the above are too coarse. |
 | `KV_OFFLOAD` | `-nkvo` | `false` keeps the KV cache in RAM. Frees a lot, usually a big slowdown. |
 | `KV_CACHE_TYPE` | `-ctk`/`-ctv` | KV quantisation. `q8_0` default; `q4_0` halves it with some quality loss. |
+| `VRAM_TRY_AUTOFIT` | *(none)* | `true` skips every lever above for models that measurably fit in VRAM whole. See below. |
+| `VRAM_AUTOFIT_MARGIN_MIB` | *(none)* | Headroom the autofit estimate leaves free. Default `1024`. |
 | `EXTRA_LLAMA_ARGS` | *(verbatim)* | Escape hatch for flags with no variable here. |
 
 For a **MoE** model, `CPU_MOE`/`N_CPU_MOE` beats lowering `N_GPU_LAYERS`: the
 experts are the bulk of the weights but only a few are active per token, so
 parking them in RAM costs far less speed than evicting whole layers.
+
+### Applying them only when needed: `VRAM_TRY_AUTOFIT`
+
+Every lever above buys VRAM by giving up speed, so applying them to a model that
+would have fitted anyway is pure loss. `VRAM_TRY_AUTOFIT=true` sizes each model
+against the VRAM free at startup and, for the ones that fit whole, **skips the
+lot** — `N_GPU_LAYERS`, `CPU_MOE`, `N_CPU_MOE`, `OVERRIDE_TENSOR` and
+`KV_OFFLOAD` — serving them with `-ngl 99` instead. Models that do not fit get
+your settings exactly as configured.
+
+The decision is **per model**, like MTP, so a 4B and a 35B can share `/models`
+and each gets the right treatment.
+
+What goes into the estimate:
+
+| Term | How |
+|---|---|
+| Weights | Size of the GGUF on disk, all shards summed |
+| KV cache | `layers × CTX_SIZE × kv_heads × (key_len + value_len) × bytes_per_element`, read from the GGUF's own metadata, with `bytes_per_element` from `KV_CACHE_TYPE` |
+| Projector | Size of the `mmproj` file, when one is loaded |
+| Headroom | `VRAM_AUTOFIT_MARGIN_MIB`, default 1024 — compute buffers, the CUDA/HIP context, fragmentation |
+
+Free VRAM comes from `nvidia-smi` where present, otherwise from the kernel's
+AMD counters (`/sys/class/drm/card*/device/mem_info_vram_{total,used}`), summed
+over every visible GPU because llama.cpp splits a model across all of them.
+
+It reports what it decided:
+
+```
+>> VRAM autofit: 24010 MiB free now, keeping 1024 MiB of headroom.
+>> qwen3.6-35b-a3b-mtp: needs ~19652 MiB (weights 16864 + KV 2788), budget 22986 MiB
+   -> fits, VRAM settings skipped
+```
+
+**It is an estimate, and it fails safe.** Anything unmeasurable — no
+`nvidia-smi` and no AMD counters, an unreadable GGUF header, metadata without
+the attention keys — counts as *does not fit*, so your settings stay applied and
+the model stays loadable. The failure mode to avoid is stripping the settings
+that were keeping a model working.
+
+Two caveats worth knowing:
+
+- **Free VRAM is sampled once, at container start.** llama-swap keeps one model
+  loaded at a time (the group is `exclusive`), so that reading is representative
+  — but if something else on the host grabs VRAM later, the decision does not
+  change.
+- **If a model is judged to fit and then fails to load**, raise
+  `VRAM_AUTOFIT_MARGIN_MIB`. That is what it is for.
 
 ### Example 1 — dense model, 100 % in VRAM
 

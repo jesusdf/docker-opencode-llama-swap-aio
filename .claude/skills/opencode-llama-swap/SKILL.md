@@ -229,6 +229,24 @@ inference is wrong, and measured:
     defaults in `entrypoint.sh` and `init-llama-swap.sh` in sync — they are
     declared separately in each file.
 
+13. **`VRAM_TRY_AUTOFIT` skips the VRAM-relief group per model.** The relief
+    flags live in `VRAM_TUNING[]`, kept apart from `TUNING[]` precisely so they
+    can be dropped per model; `-ngl` is forced to 99 for a model that fits,
+    since `N_GPU_LAYERS` is itself a spill-to-RAM lever. The estimate is
+    weights (all shards) + KV cache + mmproj, against free VRAM minus
+    `VRAM_AUTOFIT_MARGIN_MIB`.
+
+    **Fail safe: anything unmeasurable must count as "does not fit."** No
+    `nvidia-smi`/AMD counters, unreadable header, missing metadata — all keep
+    the settings applied. Stripping the settings that were keeping a model
+    loadable is the one outcome this feature must never produce.
+
+    The KV figure comes from a real GGUF metadata parse
+    (`block_count`, `attention.head_count_kv`, `attention.{key,value}_length`,
+    falling back to `embedding_length / head_count` for head_dim). Verified
+    against Qwen3.6-35B-A3B: 41 × 65536 × 2 × 512 × 1.0625 = 2788 MiB, matching
+    the parser exactly.
+
 ## Conventions
 
 - **All comments are written in English** — code, YAML, Dockerfile, and shell.
