@@ -232,20 +232,38 @@ inference is wrong, and measured:
 13. **`VRAM_TRY_AUTOFIT` skips the VRAM-relief group per model.** The relief
     flags live in `VRAM_TUNING[]`, kept apart from `TUNING[]` precisely so they
     can be dropped per model; `-ngl` is forced to 99 for a model that fits,
-    since `N_GPU_LAYERS` is itself a spill-to-RAM lever. The estimate is
-    weights (all shards) + KV cache + mmproj, against free VRAM minus
-    `VRAM_AUTOFIT_MARGIN_MIB`.
+    since `N_GPU_LAYERS` is itself a spill-to-RAM lever.
+
+    `gguf_probe()` parses the header once and returns KV bytes, sliding window
+    and `token_embd` bytes. Two corrections in it are load-bearing, and both
+    came from measuring rather than reasoning — do not "simplify" either away:
+    - **Subtract `token_embd`** from the weight total. It stays in system RAM.
+      Usually a small share of the file, but formats that compress the body hard
+      and leave the embedding alone (MXFP4) push it past 8%.
+    - **Halve the cached layers when `attention.sliding_window` is set.**
+      Charging every layer the full context is ~1.7x too high there.
+
+    Tensor sizes come from the gap to the next tensor's offset, not a type
+    table, so an unknown quantisation format still measures correctly.
 
     **Fail safe: anything unmeasurable must count as "does not fit."** No
-    `nvidia-smi`/AMD counters, unreadable header, missing metadata — all keep
-    the settings applied. Stripping the settings that were keeping a model
-    loadable is the one outcome this feature must never produce.
+    `nvidia-smi`/AMD counters, unreadable header, missing metadata, `token_embd`
+    larger than the file — all keep the settings applied. Stripping the settings
+    that were keeping a model loadable is the one outcome this must never
+    produce.
 
-    The KV figure comes from a real GGUF metadata parse
-    (`block_count`, `attention.head_count_kv`, `attention.{key,value}_length`,
-    falling back to `embedding_length / head_count` for head_dim). Verified
-    against Qwen3.6-35B-A3B: 41 × 65536 × 2 × 512 × 1.0625 = 2788 MiB, matching
-    the parser exactly.
+    **Free VRAM is read once, at startup, before any model loads.** That number
+    is therefore not comparable with `nvidia-smi` taken while a model is
+    running — a reported "budget 15049 MiB" next to a live "13258 MiB / 16311
+    MiB" is two moments, not a bug. This has already been raised once.
+14. **Two llama-server warnings are expected, not faults.** Both appear at model
+    load and neither needs fixing:
+    - `cache_reuse is not supported by this context, it will be disabled` —
+      sliding-window models (and loaded projectors) make `--cache-reuse` inert.
+    - `chat template does NOT support preserving reasoning, --reasoning-preserve
+      has no effect` — llama.cpp gates that flag on a template capability it
+      detects by name. This is the observed proof that the server flag alone is
+      not enough, and why opencode also sends `preserve_thinking` (gotcha 12).
 
 ## Conventions
 

@@ -47,7 +47,10 @@ shopt -s nullglob
 # VRAM free right now and, when it fits, skip every VRAM-relief setting below
 # (they only cost speed). When it does not fit — or when anything cannot be
 # measured — the settings are applied exactly as configured.
-: "${VRAM_TRY_AUTOFIT:=false}"
+#
+# On by default: the fallback in every unmeasurable case is the behaviour you
+# would get without it, so the worst outcome is no optimisation.
+: "${VRAM_TRY_AUTOFIT:=true}"
 # Headroom left for llama.cpp's compute buffers, the CUDA/HIP context and
 # fragmentation, none of which are part of the weights-plus-KV figure.
 : "${VRAM_AUTOFIT_MARGIN_MIB:=1024}"
@@ -183,11 +186,24 @@ model_weight_bytes() {
     printf '%s\n' "$total"
 }
 
-# Estimated KV cache bytes at CTX_SIZE, read from the GGUF's own metadata.
+# Reads a GGUF header and prints three numbers on one line:
+#
+#   <kv cache bytes at CTX_SIZE>  <sliding window, 0 if none>  <token_embd bytes>
+#
 # Prints nothing when the header cannot be parsed or the keys are missing.
-kv_cache_bytes() {
+#
+# Two things are not obvious and both were measured rather than assumed:
+#
+#  - Sliding-window models interleave windowed layers with full-attention ones,
+#    and llama.cpp sizes the two caches separately. Charging every layer the
+#    full context is ~1.7x too high for such a model.
+#  - `token_embd.weight` is not offloaded to VRAM, so its bytes have to come off
+#    the weight total. It is easy to miss because it is usually a small share of
+#    the file — but formats that compress the body hard and leave the embedding
+#    alone (MXFP4) push it past 8%, which is enough to change a fit decision.
+gguf_probe() {
     python3 - "$1" "$CTX_SIZE" "$KV_CACHE_TYPE" <<'PY'
-import struct, sys
+import os, struct, sys
 
 path, ctx, kv_type = sys.argv[1], int(sys.argv[2]), sys.argv[3].lower()
 
@@ -222,7 +238,7 @@ try:
     version, = struct.unpack_from("<I", buf, pos); pos += 4
     if version < 2:
         sys.exit(1)
-    pos += 8                                  # tensor_count, unused here
+    tensor_count, = struct.unpack_from("<Q", buf, pos); pos += 8
     kv_count, = struct.unpack_from("<Q", buf, pos); pos += 8
 
     def read_string(p):
@@ -255,17 +271,49 @@ try:
         return None
 
     md = {}
+    alignment = 32
     wanted = ("block_count", "attention.head_count_kv",
               "attention.key_length", "attention.value_length",
-              "embedding_length", "attention.head_count")
+              "embedding_length", "attention.head_count",
+              "attention.sliding_window")
     for _ in range(kv_count):
         key, pos = read_string(pos)
         vtype, = struct.unpack_from("<I", buf, pos); pos += 4
+        if key == "general.alignment":
+            alignment = read_value(pos, vtype) or 32
         if key.split(".", 1)[-1] in wanted:
             md[key.split(".", 1)[-1]] = read_value(pos, vtype)
         pos = skip_value(pos, vtype)
+
+    # Tensor table, for the size of the tensors that never reach VRAM. Sizes
+    # come from the gap to the next tensor's offset rather than from a type
+    # table, so a quantisation format this script has never heard of still
+    # measures correctly.
+    tensors = []
+    for _ in range(tensor_count):
+        name, pos = read_string(pos)
+        ndim, = struct.unpack_from("<I", buf, pos); pos += 4
+        pos += 8 * ndim                       # dims, unused
+        pos += 4                              # type, unused
+        offset, = struct.unpack_from("<Q", buf, pos); pos += 8
+        tensors.append((offset, name))
 except (struct.error, ValueError, IndexError):
     sys.exit(1)
+
+data_start = (pos + alignment - 1) // alignment * alignment
+try:
+    file_size = os.path.getsize(path)
+except OSError:
+    sys.exit(1)
+
+tensors.sort()
+embd_bytes = 0
+for i, (offset, name) in enumerate(tensors):
+    if name != "token_embd.weight":
+        continue
+    end = tensors[i + 1][0] if i + 1 < len(tensors) else file_size - data_start
+    embd_bytes = max(0, end - offset)
+    break
 
 layers = md.get("block_count")
 kv_heads = md.get("attention.head_count_kv")
@@ -281,7 +329,18 @@ if not head_dim:
     head_dim = emb // heads
 v_dim = md.get("attention.value_length") or head_dim
 
-print(int(layers * ctx * kv_heads * (head_dim + v_dim) * ELEM[kv_type]))
+swa = md.get("attention.sliding_window") or 0
+
+# With a sliding window, assume the usual 1:1 interleave: half the layers cache
+# the full context, the rest only the window.
+if swa and swa < ctx:
+    full_layers = (layers + 1) // 2
+    cells = full_layers * ctx + (layers - full_layers) * swa
+else:
+    cells = layers * ctx
+
+print(int(cells * kv_heads * (head_dim + v_dim) * ELEM[kv_type]),
+      int(swa), int(embd_bytes))
 PY
 }
 
@@ -435,9 +494,11 @@ FREE_VRAM_MIB=""
 if [ "$AUTOFIT" = 1 ]; then
     FREE_VRAM_MIB="$(detect_free_vram_mib)"
     if [ -z "$FREE_VRAM_MIB" ]; then
-        echo ">> WARNING: VRAM_TRY_AUTOFIT is set but free VRAM could not be measured — no" >&2
-        echo ">>          nvidia-smi and no AMD mem_info_vram_* counters. Applying the VRAM" >&2
-        echo ">>          settings as configured, which is the safe assumption." >&2
+        # Not a warning: autofit is on by default, so this is simply "no
+        # optimisation was possible", and the VRAM settings apply as configured
+        # — exactly what would have happened without the feature.
+        echo ">> VRAM autofit: free VRAM could not be measured (no nvidia-smi, no AMD"
+        echo ">>   mem_info_vram_* counters); applying the VRAM settings as configured."
         AUTOFIT=0
     else
         echo ">> VRAM autofit: ${FREE_VRAM_MIB} MiB free now, keeping ${VRAM_AUTOFIT_MARGIN_MIB} MiB of headroom."
@@ -450,20 +511,30 @@ fi
 # autofit would silently strip the settings keeping a model loadable.
 model_fits_vram() {
     local file="$1" mmproj="$2" id="$3"
-    local weights kv extra=0 need_mib budget_mib
+    local files kv swa embd extra=0 need_mib budget_mib probe
 
-    weights="$(model_weight_bytes "$file")"
-    if [ -z "$weights" ] || [ "$weights" = 0 ]; then
-        echo ">> ${id}: cannot size the weights — assuming it does not fit." >&2
+    files="$(model_weight_bytes "$file")"
+    if [ -z "$files" ] || [ "$files" = 0 ]; then
+        echo ">> ${id}: cannot size the weights — treating it as 'does not fit'."
         return 1
     fi
     [ -n "$mmproj" ] && [ -f "$mmproj" ] && extra=$(stat -c%s "$mmproj")
 
-    if ! kv="$(kv_cache_bytes "$file")" || [ -z "$kv" ]; then
-        echo ">> ${id}: cannot estimate the KV cache from the GGUF metadata — assuming it" >&2
-        echo ">>   does not fit. Unset VRAM_TRY_AUTOFIT to silence this." >&2
+    if ! probe="$(gguf_probe "$file")" || [ -z "$probe" ]; then
+        echo ">> ${id}: cannot read the GGUF header — treating it as 'does not fit', so the"
+        echo ">>   VRAM settings apply as configured."
         return 1
     fi
+    read -r kv swa embd <<<"$probe"
+
+    # token_embd stays in system RAM, so it is in the file but never in VRAM.
+    # A truncated or corrupt file can make this bigger than the file itself;
+    # that is not a model we can size, so fall back to "does not fit".
+    if [ "${embd:-0}" -ge "$files" ]; then
+        echo ">> ${id}: GGUF header and file size disagree — treating it as 'does not fit'."
+        return 1
+    fi
+    local weights=$(( files - embd ))
 
     need_mib=$(( (weights + kv + extra) / 1024 / 1024 ))
     budget_mib=$(( FREE_VRAM_MIB - VRAM_AUTOFIT_MARGIN_MIB ))
@@ -474,6 +545,13 @@ model_fits_vram() {
         "$([ "$extra" -gt 0 ] && printf ' + mmproj %s' "$((extra / 1024 / 1024))")" \
         "$budget_mib" \
         "$([ "$need_mib" -le "$budget_mib" ] && echo 'fits, VRAM settings skipped' || echo 'does not fit, VRAM settings applied')"
+
+    if [ "${embd:-0}" -gt 0 ] || { [ "${swa:-0}" -gt 0 ] && [ "$swa" -lt "$CTX_SIZE" ]; }; then
+        printf '>>   (%s%s%s)\n' \
+            "$([ "${embd:-0}" -gt 0 ] && printf 'excludes %s MiB of token_embd, which is not offloaded' "$((embd / 1024 / 1024))")" \
+            "$([ "${embd:-0}" -gt 0 ] && [ "${swa:-0}" -gt 0 ] && [ "$swa" -lt "$CTX_SIZE" ] && printf '; ')" \
+            "$([ "${swa:-0}" -gt 0 ] && [ "$swa" -lt "$CTX_SIZE" ] && printf 'sliding window %s, so about half the layers cache the full context' "$swa")"
+    fi
 
     [ "$need_mib" -le "$budget_mib" ]
 }

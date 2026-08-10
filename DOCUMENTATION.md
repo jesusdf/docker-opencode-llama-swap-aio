@@ -402,7 +402,7 @@ the GPU, which is what the stack did before these existed.
 | `OVERRIDE_TENSOR` | `-ot` | Placement by tensor-name regex, when the above are too coarse. |
 | `KV_OFFLOAD` | `-nkvo` | `false` keeps the KV cache in RAM. Frees a lot, usually a big slowdown. |
 | `KV_CACHE_TYPE` | `-ctk`/`-ctv` | KV quantisation. `q8_0` default; `q4_0` halves it with some quality loss. |
-| `VRAM_TRY_AUTOFIT` | *(none)* | `true` skips every lever above for models that measurably fit in VRAM whole. See below. |
+| `VRAM_TRY_AUTOFIT` | *(none)* | **On by default.** Skips every lever above for models that measurably fit in VRAM whole. See below. |
 | `VRAM_AUTOFIT_MARGIN_MIB` | *(none)* | Headroom the autofit estimate leaves free. Default `1024`. |
 | `EXTRA_LLAMA_ARGS` | *(verbatim)* | Escape hatch for flags with no variable here. |
 
@@ -413,11 +413,11 @@ parking them in RAM costs far less speed than evicting whole layers.
 ### Applying them only when needed: `VRAM_TRY_AUTOFIT`
 
 Every lever above buys VRAM by giving up speed, so applying them to a model that
-would have fitted anyway is pure loss. `VRAM_TRY_AUTOFIT=true` sizes each model
-against the VRAM free at startup and, for the ones that fit whole, **skips the
-lot** — `N_GPU_LAYERS`, `CPU_MOE`, `N_CPU_MOE`, `OVERRIDE_TENSOR` and
-`KV_OFFLOAD` — serving them with `-ngl 99` instead. Models that do not fit get
-your settings exactly as configured.
+would have fitted anyway is pure loss. `VRAM_TRY_AUTOFIT` — **on by default** —
+sizes each model against the VRAM free at startup and, for the ones that fit
+whole, **skips the lot**: `N_GPU_LAYERS`, `CPU_MOE`, `N_CPU_MOE`,
+`OVERRIDE_TENSOR` and `KV_OFFLOAD`, serving them with `-ngl 99` instead. Models
+that do not fit get your settings exactly as configured.
 
 The decision is **per model**, like MTP, so a 4B and a 35B can share `/models`
 and each gets the right treatment.
@@ -426,10 +426,15 @@ What goes into the estimate:
 
 | Term | How |
 |---|---|
-| Weights | Size of the GGUF on disk, all shards summed |
-| KV cache | `layers × CTX_SIZE × kv_heads × (key_len + value_len) × bytes_per_element`, read from the GGUF's own metadata, with `bytes_per_element` from `KV_CACHE_TYPE` |
+| Weights | GGUF size on disk, all shards summed, **minus `token_embd`** — that tensor stays in system RAM and never reaches VRAM |
+| KV cache | `cells × kv_heads × (key_len + value_len) × bytes_per_element`, from the GGUF metadata, with `bytes_per_element` from `KV_CACHE_TYPE`. `cells` is `layers × CTX_SIZE`, except with a sliding window, where half the layers cache the full context and the rest only the window |
 | Projector | Size of the `mmproj` file, when one is loaded |
-| Headroom | `VRAM_AUTOFIT_MARGIN_MIB`, default 1024 — compute buffers, the CUDA/HIP context, fragmentation |
+| Headroom | `VRAM_AUTOFIT_MARGIN_MIB`, default 1024 — the CUDA/HIP context, compute buffers, fragmentation |
+
+Both weight and KV subtleties are worth stating because the obvious formula gets
+them wrong by enough to flip a decision: `token_embd` can be 8 % of a file where
+the body is heavily quantised but the embedding is not, and charging every layer
+the full context is 1.7× too high for a sliding-window model.
 
 Free VRAM comes from `nvidia-smi` where present, otherwise from the kernel's
 AMD counters (`/sys/class/drm/card*/device/mem_info_vram_{total,used}`), summed
@@ -438,9 +443,10 @@ over every visible GPU because llama.cpp splits a model across all of them.
 It reports what it decided:
 
 ```
->> VRAM autofit: 24010 MiB free now, keeping 1024 MiB of headroom.
->> qwen3.6-35b-a3b-mtp: needs ~19652 MiB (weights 16864 + KV 2788), budget 22986 MiB
-   -> fits, VRAM settings skipped
+>> VRAM autofit: 15849 MiB free now, keeping 800 MiB of headroom.
+>> gpt-oss-20b: needs ~12865 MiB (weights 12048 + KV 817), budget 15049 MiB -> fits, VRAM settings skipped
+>>   (excludes 1104 MiB of token_embd, which is not offloaded; sliding window 128,
+>>    so about half the layers cache the full context)
 ```
 
 **It is an estimate, and it fails safe.** Anything unmeasurable — no
@@ -449,12 +455,14 @@ the attention keys — counts as *does not fit*, so your settings stay applied a
 the model stays loadable. The failure mode to avoid is stripping the settings
 that were keeping a model working.
 
-Two caveats worth knowing:
+Two things to keep in mind:
 
-- **Free VRAM is sampled once, at container start.** llama-swap keeps one model
-  loaded at a time (the group is `exclusive`), so that reading is representative
-  — but if something else on the host grabs VRAM later, the decision does not
-  change.
+- **Free VRAM is sampled once, at container start**, before any model is
+  loaded. That is the right basis — llama-swap keeps one model loaded at a time
+  (the group is `exclusive`), so a model being loaded has the GPU to itself —
+  but it means the number in the log is *not* comparable with what `nvidia-smi`
+  shows once a model is running. Those are different moments, not a
+  contradiction.
 - **If a model is judged to fit and then fails to load**, raise
   `VRAM_AUTOFIT_MARGIN_MIB`. That is what it is for.
 
@@ -535,6 +543,16 @@ and each turn shares almost all of its prefix with the previous one — exactly
 the case cache reuse exists for. Paying full prompt processing on every turn to
 keep a capability that a coding session almost never uses is a bad deal, so you
 have to ask for it.
+
+A projector is not the only thing that disables cache reuse. Sliding-window
+models do too, and llama-server says so on load:
+
+```
+W srv load_model: cache_reuse is not supported by this context, it will be disabled
+```
+
+Nothing to fix — `--cache-reuse 256` is simply inert for those models, and the
+argument above for keeping the projector off does not apply to them.
 
 ### The second reason: mmproj and MTP cannot coexist
 
@@ -715,6 +733,19 @@ neither ignores both.
 One caveat worth stating plainly: this can only help if the client actually
 sends prior reasoning back in the request history. Where it does not, both the
 flag and the kwarg are inert rather than harmful.
+
+Not every template supports the idea at all, and llama-server says so on load:
+
+```
+W srv init: chat template does NOT support preserving reasoning,
+            --reasoning-preserve has no effect
+```
+
+That is expected and harmless — gpt-oss, for one, has no such concept. It is
+also exactly why opencode sends `preserve_thinking` as well: the warning shows
+llama.cpp gating the flag on a template capability it detects by name, so on a
+template it does not recognise the server-side route would silently do nothing.
+Set `PRESERVE_REASONING=false` if you would rather not see the warning.
 
 Related server-side flags, reachable through `EXTRA_LLAMA_ARGS`:
 `--reasoning-budget N` (cap thinking tokens) and `--reasoning-format`
