@@ -154,9 +154,13 @@ if default not in ids:
 # see is `chat_template_kwargs`, and unknown keys in this options dict are
 # forwarded verbatim as top-level request fields, so that is how we pass it.
 #
-# `enable_thinking` is the boolean most thinking models use (Qwen3, DeepSeek-R1,
-# GLM…); `reasoning_effort` is what the gpt-oss family reads. Sending both costs
-# nothing — a template simply ignores the variable it does not use.
+# Each family named the same idea differently, so all the spellings go out at
+# once; a template simply ignores the variable it does not use.
+#
+#   enable_thinking     Qwen3/Qwen3.6, DeepSeek-R1, GLM — a boolean, and the
+#                       only one those templates read (they ignore the effort)
+#   reasoning_effort    the gpt-oss family
+#   reasoning_strength  Muse-Glimmer (also accepts "xhigh")
 effort = os.environ["REASONING_EFFORT"]
 mode = os.environ["REASONING_MODE"]
 
@@ -164,7 +168,7 @@ if mode == "false":
     # Off: don't advertise an effort level we are also disabling.
     model_options = {"chat_template_kwargs": {"enable_thinking": False}}
 else:
-    kwargs = {"reasoning_effort": effort}
+    kwargs = {"reasoning_effort": effort, "reasoning_strength": effort}
     if mode == "true":
         kwargs["enable_thinking"] = True
 

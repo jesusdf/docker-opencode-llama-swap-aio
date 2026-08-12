@@ -42,7 +42,9 @@ parameters and SSH key are all driven by environment variables.
 | `MODEL_ID` | `qwen3.6-35b-a3b-mtp` | Internal name used for the llama-swap model (`swap/<MODEL_ID>`) and the opencode model. |
 | `MMPROJ_ENABLED` | `false` | Accept images/audio by loading the multimodal projector. **Off by default** because a loaded projector disables llama.cpp's prompt cache reuse, and because it is incompatible with MTP. See [the vision Q&A](#q-does-vision--multimodal-work). |
 | `MTP_ENABLED` | `auto` | Multi-token prediction: the model drafts ahead with heads baked into its own weights. ~1.5-2x faster generation. `auto` detects the heads in each GGUF and enables it only where present; `true` forces it everywhere, `false` never. Turned off for any model that loads a projector, and for all models when `N_PARALLEL != 1`. |
-| `SPEC_DRAFT_N_MAX` | `2` | Tokens drafted per step when MTP is on (`--spec-draft-n-max`). llama.cpp's own default is 3. |
+| `SPEC_DRAFT_N_MAX` | `2` | Tokens drafted per step when MTP or DFlash is on (`--spec-draft-n-max`). llama.cpp's own default is 3. |
+| `DFLASH_ENABLED` | `auto` | The other speculative-decoding family: a separate small draft model shipped next to the weights (`dflash-*.gguf`). `auto` uses it wherever that file exists. Costs its size in VRAM; skipped on models that already have MTP heads. |
+| `DFLASH_QUANT` | `Q8_0` | Which draft to pick when a repo ships several. A preference, not a filter: a draft named anything else is still used. Empty disables the preference. |
 | `MMPROJ_QUANT` | `F16` | Which projector to download when the repo ships several (`BF16`/`F16`/`F32`). Empty downloads them all. Only used when `MMPROJ_ENABLED=true`. |
 | `HF_TOKEN` | *(empty)* | Hugging Face token; only needed for gated/private repos. |
 | `CTX_SIZE` | `262144` | Context window (`--ctx-size`). |
@@ -400,7 +402,7 @@ the GPU, which is what the stack did before these existed.
 | `CPU_MOE` | `-cmoe` | MoE models: **all** expert weights to RAM, attention stays on GPU. |
 | `N_CPU_MOE` | `-ncmoe N` | Same, but only the first N layers' experts. Finer grained. |
 | `OVERRIDE_TENSOR` | `-ot` | Placement by tensor-name regex, when the above are too coarse. |
-| `KV_OFFLOAD` | `-nkvo` | `false` keeps the KV cache in RAM. Frees a lot, usually a big slowdown. |
+| `KV_ON_GPU` | `-nkvo` | `false` moves the KV cache to RAM. Frees a lot, usually a big slowdown. |
 | `KV_CACHE_TYPE` | `-ctk`/`-ctv` | KV quantisation. `q8_0` default; `q4_0` halves it with some quality loss. |
 | `VRAM_TRY_AUTOFIT` | *(none)* | **On by default.** Skips every lever above for models that measurably fit in VRAM whole. See below. |
 | `VRAM_AUTOFIT_MARGIN_MIB` | *(none)* | Headroom the autofit estimate leaves free. Default `1024`. |
@@ -416,7 +418,7 @@ Every lever above buys VRAM by giving up speed, so applying them to a model that
 would have fitted anyway is pure loss. `VRAM_TRY_AUTOFIT` — **on by default** —
 sizes each model against the VRAM free at startup and, for the ones that fit
 whole, **skips the lot**: `N_GPU_LAYERS`, `CPU_MOE`, `N_CPU_MOE`,
-`OVERRIDE_TENSOR` and `KV_OFFLOAD`, serving them with `-ngl 99` instead. Models
+`OVERRIDE_TENSOR` and `KV_ON_GPU`, serving them with `-ngl 99` instead. Models
 that do not fit get your settings exactly as configured.
 
 The decision is **per model**, like MTP, so a 4B and a 35B can share `/models`
@@ -480,7 +482,7 @@ MMPROJ_ENABLED=false    # no vision: keeps prompt cache reuse (and VRAM) free
 CTX_SIZE=32768          # the single biggest VRAM lever
 KV_CACHE_TYPE=q8_0
 N_GPU_LAYERS=99         # all layers on the GPU
-KV_OFFLOAD=true         # KV cache on the GPU too
+KV_ON_GPU=true          # KV cache on the GPU too
 CPU_MOE=false           # dense model: nothing to offload
 N_CPU_MOE=
 OVERRIDE_TENSOR=
@@ -502,13 +504,14 @@ CTX_SIZE=32768
 KV_CACHE_TYPE=q8_0
 N_GPU_LAYERS=99         # keep attention + non-expert tensors on the GPU
 CPU_MOE=true            # -cmoe: all expert weights to RAM
-KV_OFFLOAD=true
+KV_ON_GPU=true          # KV cache stays on the GPU
 ```
 
 Still short on VRAM? Trade back gradually, in this order: swap `CPU_MOE=true`
 for `N_CPU_MOE=<N>` and tune N (only the first N layers' experts go to RAM, the
 rest stay on the GPU — raise N until it fits); then lower `CTX_SIZE`; then
-`KV_CACHE_TYPE=q4_0`; and only then `N_GPU_LAYERS`.
+`KV_CACHE_TYPE=q4_0`; then `KV_ON_GPU=false` to push the KV cache to RAM; and
+only then `N_GPU_LAYERS`.
 
 **One caveat:** these variables are global — they apply to every model
 llama-swap serves, not per model. If you keep both examples above in the same
@@ -687,11 +690,21 @@ and like this for `false` (no point advertising an effort level you're disabling
 "options": { "chat_template_kwargs": { "enable_thinking": false } }
 ```
 
-`extraBody` is a third route to the same setting: the provider merges it into
-the request body verbatim, and `think` is the field some llama.cpp builds and
-proxies read instead of `chat_template_kwargs`. All three carry the same
-`REASONING_EFFORT` value, so whichever one the server actually honours agrees
-with the other two. Sent only when reasoning is on.
+Every spelling goes out at once because each family named the same idea
+differently, and a template silently drops what it does not read:
+
+| Field | Read by |
+|---|---|
+| `chat_template_kwargs.enable_thinking` | Qwen3/Qwen3.6, DeepSeek-R1, GLM — a boolean; these ignore the effort level entirely |
+| `chat_template_kwargs.reasoning_effort` | the gpt-oss family |
+| `chat_template_kwargs.reasoning_strength` | Muse-Glimmer, which also accepts `xhigh` |
+| `extraBody.think` | some llama.cpp builds and proxies, merged into the request body verbatim |
+| `reasoningEffort` | opencode's own field, for when this config is pointed at a provider that honours it |
+
+All carry the same `REASONING_EFFORT`, so whichever the server honours agrees
+with the rest. Sent only when reasoning is on. The practical consequence: on a
+Qwen model `REASONING_EFFORT` does nothing at all — only `REASONING_ENABLED`
+moves the needle.
 
 Remember `opencode.json` is only regenerated when missing or when
 `REGENERATE_OPENCODE_CONFIG=true` — set that after changing either variable.
@@ -827,6 +840,29 @@ The `N_PARALLEL` check runs whenever MTP could be used at all, `auto` included:
 >>          implements a single slot so far. Keeping N_PARALLEL and disabling MTP
 >>          for every model. Set N_PARALLEL=1 to get the MTP speedup back.
 ```
+
+### DFlash, the other family
+
+MTP is not the only speculative decoding llama.cpp supports. **DFlash** drafts a
+whole block of tokens with a *separate*, much smaller model instead of heads
+baked into the weights — unsloth publishes it as `dflash-*.gguf` in the same
+repo, so `init-llama-swap.sh` downloads it and finds it the same way it finds a
+projector.
+
+`DFLASH_ENABLED` works exactly like `MTP_ENABLED` (`auto`/`true`/`false`,
+decided per model). The differences that matter:
+
+| | MTP | DFlash |
+|---|---|---|
+| Where the drafting comes from | heads inside the weights | a separate draft model |
+| Extra VRAM | none | the draft model's size (~1.5 GB for Muse-Glimmer) |
+| Detected by | `nextn` markers in the GGUF | a `dflash-*.gguf` next to the weights |
+| Quant choice | n/a — part of the weights | `DFLASH_QUANT`, default `Q8_0` |
+
+Both set `--spec-type`, so a model that somehow had both would get MTP only —
+it is the one that needs nothing extra in VRAM. The draft model *is* counted in
+the [autofit estimate](#q-the-model-barely-fits-in-vram-what-can-i-offload-to-ram),
+and it inherits MTP's two blockers: a loaded projector, and `N_PARALLEL != 1`.
 
 ### Requirements
 

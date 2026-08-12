@@ -21,10 +21,9 @@ shopt -s nullglob
 : "${HF_TOKEN:=}"
 : "${CTX_SIZE:=262144}"
 : "${N_PREDICT:=8192}"
-# Number of request slots llama-server serves concurrently (--parallel). 1 keeps
-# the previous hardcoded behaviour. Note CTX_SIZE is the *total* KV budget shared
-# by the slots, not a per-slot figure, so raising this without raising CTX_SIZE
-# leaves each request with less room.
+# Number of request slots llama-server serves concurrently (--parallel). Note
+# CTX_SIZE is the *total* KV budget shared by the slots, not a per-slot figure,
+# so raising this without raising CTX_SIZE leaves each request with less room.
 : "${N_PARALLEL:=1}"
 : "${KV_CACHE_TYPE:=q8_0}"
 : "${MODEL_TTL:=900}"
@@ -34,13 +33,14 @@ shopt -s nullglob
 : "${LLAMA_API_KEY:=}"
 : "${PORT:=8080}"
 
-# VRAM tuning. The defaults reproduce the previous hardcoded behaviour: all
-# layers on the GPU, KV cache on the GPU, no MoE/tensor overrides.
+# VRAM tuning. The defaults keep everything on the GPU: all layers, KV cache
+# included, with no MoE or tensor overrides.
 : "${N_GPU_LAYERS:=99}"
 : "${CPU_MOE:=false}"
 : "${N_CPU_MOE:=}"
 : "${OVERRIDE_TENSOR:=}"
-: "${KV_OFFLOAD:=true}"
+# Keep the KV cache in VRAM. false pushes it to RAM (llama-server's -nkvo).
+: "${KV_ON_GPU:=true}"
 : "${EXTRA_LLAMA_ARGS:=}"
 
 # Try to keep the whole model in VRAM: measure what each model needs against the
@@ -73,9 +73,32 @@ shopt -s nullglob
 : "${MTP_ENABLED:=auto}"
 : "${SPEC_DRAFT_N_MAX:=2}"
 
+# DFlash: the other speculative-decoding family llama.cpp supports. Unlike MTP
+# the drafting is done by a *separate*, much smaller model shipped alongside the
+# weights (unsloth publishes it as 'dflash-*.gguf' in the same repo), so this
+# costs extra VRAM in exchange for the speedup.
+#
+# auto|true|false, resolved per model like MTP: 'auto' uses it wherever a draft
+# model is actually present next to the weights.
+: "${DFLASH_ENABLED:=auto}"
+# Which DFlash draft to use when a repo ships several. Same boundary-aware
+# matching as MMPROJ_QUANT. Q8_0 is the sensible default: the draft only
+# proposes tokens that the main model then verifies, so its errors are caught
+# and there is nothing to gain from a larger one. Unlike MMPROJ_QUANT this is a
+# preference rather than a filter — if nothing matches it, whatever draft the
+# repo does ship is downloaded and used (most publish exactly one).
+# '=' not ':=' so an explicitly empty value means "any".
+: "${DFLASH_QUANT=Q8_0}"
+
 case "${MMPROJ_ENABLED,,}" in
     1|true|yes|on) USE_MMPROJ=1 ;;
     *)             USE_MMPROJ=0 ;;
+esac
+
+case "${DFLASH_ENABLED,,}" in
+    1|true|yes|on)  DFLASH_MODE=true ;;
+    0|false|no|off) DFLASH_MODE=false ;;
+    *)              DFLASH_MODE=auto ;;
 esac
 
 # ----------------------------------------------------------------------------
@@ -275,7 +298,7 @@ try:
     wanted = ("block_count", "attention.head_count_kv",
               "attention.key_length", "attention.value_length",
               "embedding_length", "attention.head_count",
-              "attention.sliding_window")
+              "attention.sliding_window", "attention.sliding_window_pattern")
     for _ in range(kv_count):
         key, pos = read_string(pos)
         vtype, = struct.unpack_from("<I", buf, pos); pos += 4
@@ -331,10 +354,15 @@ v_dim = md.get("attention.value_length") or head_dim
 
 swa = md.get("attention.sliding_window") or 0
 
-# With a sliding window, assume the usual 1:1 interleave: half the layers cache
-# the full context, the rest only the window.
+# With a sliding window, only one layer in every `pattern` caches the full
+# context; the rest cache just the window. Models that state the ratio
+# (`attention.sliding_window_pattern`) are taken at their word — Muse-Glimmer
+# says 4, i.e. 13 full layers out of 52, where assuming 1:1 would charge 26.
+# Models that only declare a window default to the 1:1 interleave.
 if swa and swa < ctx:
-    full_layers = (layers + 1) // 2
+    pattern = md.get("attention.sliding_window_pattern") or 2
+    pattern = max(1, int(pattern))
+    full_layers = max(1, -(-layers // pattern))
     cells = full_layers * ctx + (layers - full_layers) * swa
 else:
     cells = layers * ctx
@@ -359,17 +387,25 @@ mkdir -p "$MODEL_DIR"
 # vision permanently unavailable.
 existing=("$MODEL_DIR"/*"${MODEL_QUANT}"*.gguf)
 existing_mmproj=("$MODEL_DIR"/*[mM][mM][pP][rR][oO][jJ]*.gguf)
+existing_dflash=("$MODEL_DIR"/*[dD][fF][lL][aA][sS][hH]*.gguf)
 
 NEED_MODEL=0
 NEED_MMPROJ=0
+NEED_DFLASH=0
 [ ${#existing[@]} -eq 0 ] && NEED_MODEL=1
 [ "$USE_MMPROJ" = 1 ] && [ ${#existing_mmproj[@]} -eq 0 ] && NEED_MMPROJ=1
+# Fetched on 'auto' too: without the file present, 'auto' could never say yes.
+# The repo simply has no dflash-*.gguf when the model does not ship one, and
+# the --include then matches nothing.
+[ "$DFLASH_MODE" != false ] && [ ${#existing_dflash[@]} -eq 0 ] && NEED_DFLASH=1
 
-if [ "$NEED_MODEL" = 1 ] || [ "$NEED_MMPROJ" = 1 ]; then
+if [ "$NEED_MODEL" = 1 ] || [ "$NEED_MMPROJ" = 1 ] || [ "$NEED_DFLASH" = 1 ]; then
     [ "$NEED_MODEL" = 1 ] \
         && echo ">> Model '${MODEL_REPO}' (${MODEL_QUANT}) not found in ${MODEL_DIR}, downloading..."
     [ "$NEED_MMPROJ" = 1 ] \
         && echo ">> Projector (mmproj) not found in ${MODEL_DIR}, downloading..."
+    [ "$NEED_DFLASH" = 1 ] \
+        && echo ">> Looking for a DFlash draft model in '${MODEL_REPO}' ..."
 
     if ! command -v huggingface-cli >/dev/null 2>&1; then
         apt-get update
@@ -404,11 +440,38 @@ if [ "$NEED_MODEL" = 1 ] || [ "$NEED_MMPROJ" = 1 ]; then
         fi
     fi
 
+    if [ "$NEED_DFLASH" = 1 ]; then
+        if [ -n "$DFLASH_QUANT" ]; then
+            for variant in "$DFLASH_QUANT" "${DFLASH_QUANT,,}" "${DFLASH_QUANT^^}"; do
+                case " ${DOWNLOAD_INCLUDES[*]} " in
+                    *"*dflash*[-_.]${variant}*.gguf "*) continue ;;
+                esac
+                DOWNLOAD_INCLUDES+=(--include "*dflash*[-_.]${variant}*.gguf")
+            done
+        else
+            DOWNLOAD_INCLUDES+=(--include "*dflash*.gguf")
+        fi
+    fi
+
     export HF_XET_HIGH_PERFORMANCE=1
     hf download "$MODEL_REPO" \
         "${DOWNLOAD_INCLUDES[@]}" \
         --local-dir "$MODEL_DIR" \
         ${HF_TOKEN:+--token "$HF_TOKEN"}
+
+    # DFLASH_QUANT is a preference, not a requirement: a repo that ships its
+    # draft under any other name (unsloth uses 'dflash-kquant.gguf') would
+    # otherwise silently lose DFlash. Ask again without the quant filter.
+    if [ "$NEED_DFLASH" = 1 ] && [ -n "$DFLASH_QUANT" ]; then
+        got_dflash=("$MODEL_DIR"/*[dD][fF][lL][aA][sS][hH]*.gguf)
+        if [ ${#got_dflash[@]} -eq 0 ]; then
+            echo ">> No DFlash draft matching '${DFLASH_QUANT}'; fetching whatever the repo has ..."
+            hf download "$MODEL_REPO" \
+                --include "*dflash*.gguf" \
+                --local-dir "$MODEL_DIR" \
+                ${HF_TOKEN:+--token "$HF_TOKEN"}
+        fi
+    fi
 else
     echo ">> Model already present in ${MODEL_DIR}, skipping download."
 fi
@@ -476,11 +539,46 @@ resolve_mmproj() {
 }
 
 # ----------------------------------------------------------------------------
+# Resolve the DFlash draft model for a model directory. Unlike MTP, DFlash
+# drafts with a separate small model that ships next to the weights, so support
+# is a matter of whether that file is there.
+# ----------------------------------------------------------------------------
+resolve_dflash() {
+    local dir="$1" f base
+    local -a preferred=() any=()
+
+    # Same delimited match as resolve_mmproj, so 'Q8_0' cannot match 'Q8_0_L'
+    # and friends by accident.
+    local re="(^|[^a-z0-9])${DFLASH_QUANT,,}([^a-z0-9]|$)"
+
+    for f in "$dir"/*[dD][fF][lL][aA][sS][hH]*.gguf; do
+        # Belt and braces: the script sets nullglob, but an unmatched glob would
+        # otherwise be echoed verbatim and become a bogus --spec-draft-model.
+        [ -e "$f" ] || continue
+        any+=("$f")
+        base="$(basename "${f,,}")"
+        if [ -n "$DFLASH_QUANT" ] && [[ "$base" =~ $re ]]; then
+            preferred+=("$f")
+        fi
+    done
+
+    if [ ${#preferred[@]} -gt 0 ]; then
+        printf '%s\n' "${preferred[0]}"
+    elif [ ${#any[@]} -gt 0 ]; then
+        if [ -n "$DFLASH_QUANT" ] && [ ${#any[@]} -gt 1 ]; then
+            echo ">> NOTE: no DFlash draft matching '${DFLASH_QUANT}' in ${dir}, using $(basename "${any[0]}")" >&2
+        fi
+        printf '%s\n' "${any[0]}"
+    fi
+    return 0
+}
+
+# ----------------------------------------------------------------------------
 # Discover every downloaded model. Each subdirectory of /models is one model,
 # named after the directory — so MODEL_ID/MODEL_REPO only decide what gets
 # *downloaded*, while anything already sitting in /models is served too.
 # ----------------------------------------------------------------------------
-declare -a MODEL_IDS=() MODEL_FILES=() MODEL_MMPROJS=() MODEL_MTPS=() MODEL_FITS=()
+declare -a MODEL_IDS=() MODEL_FILES=() MODEL_MMPROJS=() MODEL_MTPS=() MODEL_DFLASHES=() MODEL_FITS=()
 
 # ----------------------------------------------------------------------------
 # VRAM autofit: measure once, decide per model
@@ -510,8 +608,8 @@ fi
 # unmeasurable: "I could not tell" must behave like "it does not fit", or
 # autofit would silently strip the settings keeping a model loadable.
 model_fits_vram() {
-    local file="$1" mmproj="$2" id="$3"
-    local files kv swa embd extra=0 need_mib budget_mib probe
+    local file="$1" mmproj="$2" id="$3" dflash="${4:-}"
+    local files kv swa embd extra=0 draft=0 need_mib budget_mib probe
 
     files="$(model_weight_bytes "$file")"
     if [ -z "$files" ] || [ "$files" = 0 ]; then
@@ -519,6 +617,18 @@ model_fits_vram() {
         return 1
     fi
     [ -n "$mmproj" ] && [ -f "$mmproj" ] && extra=$(stat -c%s "$mmproj")
+
+    # The DFlash draft is a second model on the GPU: its weights *and* its own
+    # KV cache, which is far from negligible (~416 MiB at ctx 65536 for
+    # Muse-Glimmer's, against 1555 MiB of weights).
+    if [ -n "$dflash" ] && [ -f "$dflash" ]; then
+        draft=$(stat -c%s "$dflash")
+        local dprobe dkv dswa dembd
+        if dprobe="$(gguf_probe "$dflash")" && [ -n "$dprobe" ]; then
+            read -r dkv dswa dembd <<<"$dprobe"
+            draft=$(( draft + dkv ))
+        fi
+    fi
 
     if ! probe="$(gguf_probe "$file")" || [ -z "$probe" ]; then
         echo ">> ${id}: cannot read the GGUF header — treating it as 'does not fit', so the"
@@ -536,13 +646,14 @@ model_fits_vram() {
     fi
     local weights=$(( files - embd ))
 
-    need_mib=$(( (weights + kv + extra) / 1024 / 1024 ))
+    need_mib=$(( (weights + kv + extra + draft) / 1024 / 1024 ))
     budget_mib=$(( FREE_VRAM_MIB - VRAM_AUTOFIT_MARGIN_MIB ))
 
-    printf '>> %s: needs ~%s MiB (weights %s + KV %s%s), budget %s MiB -> %s\n' \
+    printf '>> %s: needs ~%s MiB (weights %s + KV %s%s%s), budget %s MiB -> %s\n' \
         "$id" "$need_mib" \
         "$((weights / 1024 / 1024))" "$((kv / 1024 / 1024))" \
         "$([ "$extra" -gt 0 ] && printf ' + mmproj %s' "$((extra / 1024 / 1024))")" \
+        "$([ "$draft" -gt 0 ] && printf ' + dflash %s' "$((draft / 1024 / 1024))")" \
         "$budget_mib" \
         "$([ "$need_mib" -le "$budget_mib" ] && echo 'fits, VRAM settings skipped' || echo 'does not fit, VRAM settings applied')"
 
@@ -606,21 +717,45 @@ for dir in "$MODELS_DIR"/*/; do
         fi
     fi
 
+    # --- DFlash, decided per model ----------------------------------------
+    # Same two blockers as MTP (it is speculative decoding too), plus one of its
+    # own: both set --spec-type, so a model that somehow has each only gets MTP,
+    # which needs no second model in VRAM.
+    dflash_file=""
+    if [ "$DFLASH_MODE" != false ] && [ "$mtp" = 0 ]; then
+        if [ -n "$mmproj_file" ]; then
+            echo ">> ${id}: DFlash off — llama.cpp cannot run speculative decoding with a projector loaded." >&2
+        elif [ "$N_PARALLEL" != 1 ]; then
+            echo ">> ${id}: DFlash off — it needs --parallel 1 and N_PARALLEL is ${N_PARALLEL}." >&2
+        else
+            dflash_file="$(resolve_dflash "$dir")"
+            if [ -z "$dflash_file" ] && [ "$DFLASH_MODE" = true ]; then
+                echo ">> WARNING: ${id}: DFLASH_ENABLED=true but no dflash-*.gguf next to the weights;" >&2
+                echo ">>   nothing to draft with, so it stays off." >&2
+            fi
+        fi
+    elif [ "$DFLASH_MODE" != false ] && [ "$mtp" = 1 ]; then
+        echo ">> ${id}: DFlash skipped — this model already drafts with its own MTP heads."
+    fi
+
     # --- VRAM autofit, decided per model ----------------------------------
-    # Model sizes differ, so this cannot be a single global answer either.
+    # Runs last: the projector and the DFlash draft model both land in VRAM, so
+    # the estimate needs to know about them before it can judge the fit.
     fits=0
     if [ "$AUTOFIT" = 1 ]; then
-        model_fits_vram "$file" "$mmproj_file" "$id" && fits=1 || fits=0
+        model_fits_vram "$file" "$mmproj_file" "$id" "$dflash_file" && fits=1 || fits=0
     fi
 
     MODEL_IDS+=("$id")
     MODEL_FILES+=("$file")
     MODEL_MMPROJS+=("$mmproj_file")
     MODEL_MTPS+=("$mtp")
+    MODEL_DFLASHES+=("$dflash_file")
     MODEL_FITS+=("$fits")
 
     mtp_note=""
     [ "$mtp" = 1 ] && mtp_note=" (+MTP, drafting ${SPEC_DRAFT_N_MAX})"
+    [ -n "$dflash_file" ] && mtp_note=" (+DFlash $(basename "$dflash_file"), drafting ${SPEC_DRAFT_N_MAX})"
     echo ">> Found model '${id}': ${file}${mmproj_file:+ (+mmproj ${mmproj_file})}${mtp_note}"
 done
 
@@ -637,8 +772,7 @@ fi
 
 # ----------------------------------------------------------------------------
 # Optional llama-server flags, shared by every model.
-# Each one is omitted entirely when left at its default, so the generated
-# command line stays identical to the previous version out of the box.
+# Each one is omitted entirely when left at its default.
 # NOTE: llama-swap splits cmd on whitespace, so no value here may contain spaces.
 # ----------------------------------------------------------------------------
 TUNING=()
@@ -668,7 +802,7 @@ if [ -n "$OVERRIDE_TENSOR" ]; then
     VRAM_TUNING+=("-ot" "$OVERRIDE_TENSOR")
 fi
 
-case "${KV_OFFLOAD,,}" in
+case "${KV_ON_GPU,,}" in
     0|false|no|off) VRAM_TUNING+=("-nkvo") ;;
 esac
 
@@ -728,6 +862,8 @@ echo ">> VRAM-relief flags:${VRAM_TUNING_LINE:- (none)}${VRAM_TUNING_LINE:+ (ski
         MTP_LINE=""
         [ "${MODEL_MTPS[$i]}" = 1 ] && \
             MTP_LINE="      --spec-type draft-mtp --spec-draft-n-max ${SPEC_DRAFT_N_MAX}"
+        [ -n "${MODEL_DFLASHES[$i]}" ] && \
+            MTP_LINE="      --spec-type draft-dflash --spec-draft-model ${MODEL_DFLASHES[$i]} --spec-draft-n-max ${SPEC_DRAFT_N_MAX}"
         # A model that fits in VRAM whole gets none of the relief flags, and all
         # its layers on the GPU regardless of N_GPU_LAYERS — that setting is
         # itself a way of spilling to RAM.

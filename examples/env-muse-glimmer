@@ -8,12 +8,18 @@
 # flags off for models that do not have them.
 
 # NVIDIA 5060ti 16GB
-# https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/blob/main/Qwen3.6-35B-A3B-UD-IQ3_S.gguf
+# https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF/blob/main/Muse-Glimmer-30B-UD-Q3_K_XL.gguf
+#
+# Dense 30B, 52 layers. Multimodal, but vision is off here: the projector does
+# not fit alongside a 30B on 16 GB. This is the DFlash example.
+# Sliding window 2048 with sliding_window_pattern=4, so only 13 of its 52
+# layers cache the full context: the KV cache is ~483 MiB at 65536, small
+# enough that its full 131072 context also fits on this card.
 
-MODEL_REPO=unsloth/Qwen3.6-35B-A3B-MTP-GGUF
-MODEL_QUANT=UD-IQ3_S
+MODEL_REPO=unsloth/Muse-Glimmer-30B-GGUF
+MODEL_QUANT=UD-Q3_K_XL
 # Internal id used for the llama-swap model name and the opencode model
-MODEL_ID=qwen3.6-35b-a3b-mtp
+MODEL_ID=muse-glimmer-30b
 # --- Multimodal input (vision / audio) ------------------------------------
 # Load the multimodal projector (mmproj) so the model can accept images and
 # audio. Off by default, and that default is deliberate: llama.cpp disables
@@ -31,6 +37,10 @@ MODEL_ID=qwen3.6-35b-a3b-mtp
 # opencode only advertises attachment/image/audio support when it is true.
 # Turning it on later re-runs the projector download for the model in
 # MODEL_REPO, so no need to delete anything.
+# Off, even though this model is genuinely multimodal: the Q8_0 projector costs
+# ~1956 MiB of VRAM, which is more than a 16 GB card can spare next to a 30B.
+# It also disables --cache-reuse. Set it to true if you want vision and can
+# afford it — drop MODEL_QUANT a step to make room.
 MMPROJ_ENABLED=false
 
 # Which multimodal projector (mmproj) to download when the repo ships several —
@@ -39,7 +49,10 @@ MMPROJ_ENABLED=false
 # case-insensitive and boundary-aware, so F16 does not pull BF16. Leave empty to
 # download every projector the repo has. Ignored when MMPROJ_ENABLED is false,
 # and for text-only models, which have no projector.
-MMPROJ_QUANT=F16
+# Q8_0, not the F16 default: this repo publishes BF16 and Q8_0 projectors only,
+# and matching is boundary-aware, so F16 would find nothing. Only used if you
+# turn MMPROJ_ENABLED on above.
+MMPROJ_QUANT=Q8_0
 # Optional Hugging Face token (needed for gated/private repos)
 HF_TOKEN=
 
@@ -105,6 +118,9 @@ SPEC_DRAFT_N_MAX=2
 # load (~1.5 GB for Muse-Glimmer's), and it is counted in the autofit estimate.
 # A model that already has MTP heads keeps MTP, which needs no second model.
 # Same two blockers as MTP: a loaded projector, and N_PARALLEL != 1.
+# This is the example where DFlash actually fires: the repo ships
+# dflash-kquant.gguf (~1555 MiB) next to the weights, so 'auto' picks it up and
+# llama-server gets --spec-type draft-dflash. Budget that VRAM — autofit does.
 DFLASH_ENABLED=auto
 
 # Which DFlash draft to pick when a repo ships several. Matching is
@@ -125,9 +141,10 @@ MODEL_TTL=900
 # numbers for general thinking use (temp 1.0, top_k 20, presence_penalty 1.5) —
 # these are the coding ones. Revisit them if you switch to another model
 # family; they are not universal.
-TEMP=0.6
+# Model card: temperature 1.0, top_p 0.95, top_k 64.
+TEMP=1.0
 TOP_P=0.95
-TOP_K=20
+TOP_K=64
 # --- Reasoning / thinking -------------------------------------------------
 # Whether the model should think before answering.
 #   auto  - let the model's chat template decide (llama-server's own default)
@@ -143,7 +160,9 @@ REASONING_ENABLED=auto
 # chat_template_kwargs.reasoning_effort (what the gpt-oss family reads),
 # extraBody.think, and opencode's own reasoningEffort. Whatever ignores one of
 # them simply drops it. Ignored entirely when REASONING_ENABLED is false.
-REASONING_EFFORT=high
+# This model reads chat_template_kwargs.reasoning_strength and accepts a fourth
+# level, xhigh, which its card recommends for agentic work.
+REASONING_EFFORT=xhigh
 
 # Keep the reasoning of *every* assistant turn in the prompt, instead of only
 # the most recent one (the usual template behaviour).
@@ -164,7 +183,9 @@ REASONING_EFFORT=high
 # Applied on both sides: llama-server gets --reasoning-preserve, and opencode
 # also sends chat_template_kwargs.preserve_thinking, which is the variable
 # Qwen3.6's template reads. Ignored when REASONING_ENABLED is false.
-PRESERVE_REASONING=true
+# 'auto': its template has no preserve-reasoning variable, so forcing it would
+# only make llama-server warn that the flag does nothing.
+PRESERVE_REASONING=auto
 
 # --- VRAM tuning ----------------------------------------------------------
 # Reach for these when a model barely fits (or doesn't) in VRAM. The defaults
@@ -216,7 +237,9 @@ N_CPU_MOE=
 # Fine-grained placement by tensor-name regex (-ot), for when the two knobs
 # above are too coarse. No spaces allowed in the value.
 # Example: OVERRIDE_TENSOR=\.ffn_(up|down|gate)_exps\.=CPU
-OVERRIDE_TENSOR=blk\.([0-8])\.ffn_(gate|up|down)_exps\.=CPU,blk\.9\.ffn_(gate|up)_exps\.=CPU
+# Empty: dense model, no expert tensors to move. Lower MODEL_QUANT first if it
+# does not fit.
+OVERRIDE_TENSOR=
 
 # Keep the KV cache in VRAM. Set to false to push it to RAM (-nkvo), which frees
 # a lot at large CTX_SIZE but is usually a big slowdown — a last resort.

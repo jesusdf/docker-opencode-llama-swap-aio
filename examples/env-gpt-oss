@@ -14,7 +14,6 @@ MODEL_REPO=unsloth/gpt-oss-20b-GGUF
 MODEL_QUANT=MXFP4
 # Internal id used for the llama-swap model name and the opencode model
 MODEL_ID=gpt-oss-20b
-
 # --- Multimodal input (vision / audio) ------------------------------------
 # Load the multimodal projector (mmproj) so the model can accept images and
 # audio. Off by default, and that default is deliberate: llama.cpp disables
@@ -92,6 +91,32 @@ MTP_ENABLED=auto
 # recommends 2 for these models. Higher pays off when the draft acceptance rate
 # is high and costs when it is not, so it is worth measuring both on your GPU.
 SPEC_DRAFT_N_MAX=2
+# --- DFlash (the other speculative decoding family) -----------------------
+# Same idea as MTP, different mechanism: instead of heads baked into the
+# weights, a separate small "draft" model proposes a block of tokens that the
+# main model verifies in one pass. unsloth ships it as 'dflash-*.gguf' in the
+# same repo as the weights, so it is downloaded and picked up automatically.
+#
+#   auto  - use it on each model that has a draft model next to its weights
+#   true  - same, but warn when a model has none
+#   false - never
+#
+# The trade-off against MTP is VRAM: the draft model is a real extra model to
+# load (~1.5 GB for Muse-Glimmer's), and it is counted in the autofit estimate.
+# A model that already has MTP heads keeps MTP, which needs no second model.
+# Same two blockers as MTP: a loaded projector, and N_PARALLEL != 1.
+DFLASH_ENABLED=auto
+
+# Which DFlash draft to pick when a repo ships several. Matching is
+# case-insensitive and boundary-aware, like MMPROJ_QUANT. Q8_0 by default: the
+# draft only proposes tokens that the main model then verifies, so its mistakes
+# are caught and a bigger draft buys nothing but VRAM.
+#
+# Unlike MMPROJ_QUANT this is a *preference*, not a filter — if a repo names its
+# draft anything else (unsloth uses 'dflash-kquant.gguf'), that one is
+# downloaded and used anyway. Leave empty to skip the preference entirely.
+DFLASH_QUANT=Q8_0
+
 KV_CACHE_TYPE=q8_0
 MODEL_TTL=900
 
@@ -100,9 +125,11 @@ MODEL_TTL=900
 # numbers for general thinking use (temp 1.0, top_k 20, presence_penalty 1.5) —
 # these are the coding ones. Revisit them if you switch to another model
 # family; they are not universal.
-TEMP=0.6
-TOP_P=0.95
-TOP_K=20
+# gpt-oss: OpenAI recommends temperature 1.0 and top_p 1.0 for this family,
+# with top_k disabled (0). Different from the Qwen defaults in .env.example.
+TEMP=1.0
+TOP_P=1.0
+TOP_K=0
 # --- Reasoning / thinking -------------------------------------------------
 # Whether the model should think before answering.
 #   auto  - let the model's chat template decide (llama-server's own default)
@@ -139,7 +166,10 @@ REASONING_EFFORT=high
 # Applied on both sides: llama-server gets --reasoning-preserve, and opencode
 # also sends chat_template_kwargs.preserve_thinking, which is the variable
 # Qwen3.6's template reads. Ignored when REASONING_ENABLED is false.
-PRESERVE_REASONING=true
+# 'auto' here, not true: the gpt-oss chat template has no preserve-reasoning
+# concept, so llama-server would just warn that --reasoning-preserve does
+# nothing. REASONING_EFFORT does work — gpt-oss reads reasoning_effort natively.
+PRESERVE_REASONING=auto
 
 # --- VRAM tuning ----------------------------------------------------------
 # Reach for these when a model barely fits (or doesn't) in VRAM. The defaults
@@ -151,7 +181,7 @@ PRESERVE_REASONING=true
 # Only spill to RAM when you actually have to. Each model is sized up against
 # the VRAM free at startup, and the ones that fit whole are served with
 # everything on the GPU — N_GPU_LAYERS, CPU_MOE, N_CPU_MOE, OVERRIDE_TENSOR and
-# KV_OFFLOAD are all skipped for them, because each of those buys VRAM by giving
+# KV_ON_GPU are all skipped for them, because each of those buys VRAM by giving
 # up speed and there is nothing to buy. Models that do not fit get the settings
 # exactly as configured below.
 #
@@ -193,9 +223,9 @@ N_CPU_MOE=
 # Example: OVERRIDE_TENSOR=\.ffn_(up|down|gate)_exps\.=CPU
 OVERRIDE_TENSOR=blk\.([0-8])\.ffn_(gate|up|down)_exps\.=CPU,blk\.9\.ffn_(gate|up)_exps\.=CPU
 
-# Keep the KV cache in RAM instead of VRAM (-nkvo). Frees a lot at large
-# CTX_SIZE but is usually a big slowdown — a last resort.
-KV_OFFLOAD=true
+# Keep the KV cache in VRAM. Set to false to push it to RAM (-nkvo), which frees
+# a lot at large CTX_SIZE but is usually a big slowdown — a last resort.
+KV_ON_GPU=true
 
 # Escape hatch appended verbatim to every llama-server command line, for flags
 # that have no variable here. Space-separated; no quoting or spaces in values.
